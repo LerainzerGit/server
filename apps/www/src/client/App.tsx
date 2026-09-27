@@ -27,6 +27,7 @@ import {
 	usernamesFor,
 	where,
 } from './api'
+import { customAvatarItemIdFromPath, ItemPage } from './Item'
 import { ModerationPage } from './Moderation'
 import { StatsPage } from './Stats'
 
@@ -1506,6 +1507,7 @@ export function App() {
 	const { path, search, navigate } = useRouter()
 	const roomId = roomIdFromPath(path)
 	const lookupUsername = usernameFromPath(path)
+	const customAvatarItemId = customAvatarItemIdFromPath(path)
 
 	useEffect(() => {
 		// Config first, and everything else after it: it carries the hostnames every other
@@ -1554,6 +1556,7 @@ export function App() {
 					account={account}
 					config={config}
 					initialTab={path === '/signup' ? 'signup' : 'login'}
+					search={search}
 					navigate={navigate}
 					onAuthed={setAccount}
 				/>
@@ -1580,6 +1583,16 @@ export function App() {
 				// its data comes from `/api/stats/online`, which the existing `/api/*` allowlist
 				// entry already sends to the Worker.
 				<StatsPage search={search} navigate={navigate} />
+			) : customAvatarItemId !== null ? (
+				// The game's share link for a store item (`/d/store/customavataritem/<uuid>`), so
+				// the path is the client's, not ours. Not in `run_worker_first` either: a cold
+				// load falls through to the SPA shell like every other page here. Gated on the
+				// session rather than the config because the lookup behind it needs a token.
+				<ItemPage
+					itemId={customAvatarItemId}
+					signedIn={account === undefined ? undefined : account !== null}
+					navigate={navigate}
+				/>
 			) : lookupUsername !== null ? (
 				<PlayerPage username={lookupUsername} config={config} navigate={navigate} />
 			) : roomId !== null ? (
@@ -1917,16 +1930,29 @@ function About({ slides, error }: { slides: Slide[] | null; error: string }) {
  * (it needs a Turnstile keypair; see SiteConfig). Redirects to the account page once a
  * session exists, however it was obtained.
  */
+/**
+ * A `?next=` worth redirecting to after sign-in, or null. Only an absolute PATH on this
+ * site qualifies: it has to start with one slash and not two (`//host` is scheme-relative,
+ * i.e. another site), and carry no scheme. Anything else is dropped rather than repaired.
+ */
+function safeNextPath(raw: string | null): string | null {
+	if (!raw || !raw.startsWith('/') || raw.startsWith('//') || raw.startsWith('/\\')) return null
+	return raw
+}
+
 function LoginPage({
 	account,
 	config,
 	initialTab,
+	search,
 	navigate,
 	onAuthed,
 }: {
 	account: SelfAccount | null | undefined
 	config: SiteConfig | undefined
 	initialTab: 'signup' | 'login'
+	/** The query string, for the `?next=` a page that needs a session sends people here with. */
+	search: string
 	navigate: Navigate
 	onAuthed: (a: SelfAccount) => void
 }) {
@@ -1934,13 +1960,19 @@ function LoginPage({
 	// never disagree — switching tabs pushes history, and back goes back to the other one.
 	const tab = initialTab
 
+	// Where to go once signed in: the page that sent the visitor here, when one did (an
+	// item's share link needs a session to render), otherwise the account page. Only a
+	// same-site path is honoured — one leading slash, so `//evil.example` can't ride in
+	// through a link someone was handed — since this is a redirect after a sign-in.
+	const next = safeNextPath(new URLSearchParams(search).get('next')) ?? '/account'
+
 	useEffect(() => {
-		if (account) navigate('/account')
-	}, [account, navigate])
+		if (account) navigate(next)
+	}, [account, navigate, next])
 
 	const authed = (a: SelfAccount) => {
 		onAuthed(a)
-		navigate('/account')
+		navigate(next)
 	}
 
 	const siteKey = config?.signupEnabled ? config.turnstileSiteKey : null
@@ -1950,12 +1982,16 @@ function LoginPage({
 			<section className="card">
 				{siteKey && (
 					<div className="tabs">
-						<button className={tab === 'login' ? 'active' : ''} onClick={() => navigate('/login')}>
+						{/* The query rides along, so switching doors keeps the `?next=`. */}
+						<button
+							className={tab === 'login' ? 'active' : ''}
+							onClick={() => navigate(`/login${search}`)}
+						>
 							Sign in
 						</button>
 						<button
 							className={tab === 'signup' ? 'active' : ''}
-							onClick={() => navigate('/signup')}
+							onClick={() => navigate(`/signup${search}`)}
 						>
 							Create account
 						</button>
@@ -1984,7 +2020,7 @@ function LoginPage({
 						{siteKey && (
 							<p className="muted swap">
 								Don&apos;t have an account?{' '}
-								<Link to="/signup" navigate={navigate}>
+								<Link to={`/signup${search}`} navigate={navigate}>
 									Create one
 								</Link>
 							</p>
