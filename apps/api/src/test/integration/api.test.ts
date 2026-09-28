@@ -42,9 +42,12 @@ import { banEvasionMatch, resolveBan } from '../../bans-db'
 import {
 	createCustomAvatarItem,
 	SCHEMA_DDL as CUSTOM_AVATAR_ITEM_SCHEMA_DDL,
+	getCustomAvatarItem,
 	importCustomAvatarItem,
+	MAX_PLAYER_ITEM_PRICE,
 } from '../../custom-avatar-items-db'
 import { customAvatarItemRowLiteral } from '../../custom-avatar-items-load'
+import priceCapSql from '../../../migrations/0032_custom_avatar_item_price_cap.sql?raw'
 import {
 	countGoing,
 	SCHEMA_DDL as EVENTS_SCHEMA_DDL,
@@ -4604,6 +4607,138 @@ describe('custom avatar items', () => {
 		expect(bad.status).toBe(400)
 		expect(await bad.json()).toMatchObject({ Success: false, Value: null })
 		expect(await (await exports.default.fetch(url, { method: 'PUT' })).status).toBe(401)
+	})
+
+	// A player-made item may not sell for more than MAX_PLAYER_ITEM_PRICE (1000) tokens. The
+	// client has no ceiling of its own (`minPriceForPublicItem` is a floor), so both writes a
+	// player has enforce it — refusing, not clamping, so the creator sees what was set.
+	test('the price is capped at 1000 tokens on create and edit', async () => {
+		expect(MAX_PLAYER_ITEM_PRICE).toBe(1000)
+		const create = async (Price: unknown) => {
+			const form = new FormData()
+			form.set(
+				'metadata',
+				JSON.stringify({ Name: 'Pricey', BaseAvatarItemId: 1, BaseAvatarItemColor: '#fff', Price })
+			)
+			form.set('thumbnailImage', new File([new Uint8Array([1])], 't.png', { type: 'image/png' }))
+			form.set('design', new File([new Uint8Array([2])], 'd.png', { type: 'image/png' }))
+			return exports.default.fetch(`${ORIGIN}/api/customAvatarItems/v1`, {
+				method: 'POST',
+				headers: await bearer('205'),
+				body: form,
+			})
+		}
+		const over = await create(1001)
+		expect(over.status).toBe(400)
+		expect(await over.json()).toMatchObject({
+			Success: false,
+			Value: null,
+			Error: 'Price must be <= 1000',
+		})
+		expect((await create(-1)).status).toBe(400)
+		expect((await create(10.5)).status).toBe(400)
+		// Nothing was written for the refused ones.
+		expect(
+			await env.DB.prepare(`SELECT count(*) AS n FROM custom_avatar_item WHERE name_lower = 'pricey'`)
+				.first<{ n: number }>()
+				.then((r) => r!.n)
+		).toBe(0)
+
+		// The cap itself is allowed, inclusive; a missing price is still 0.
+		const atCap = await create(1000)
+		expect(atCap.status).toBe(200)
+		const { Value } = (await atCap.json()) as { Value: { CustomAvatarItemId: string; Price: number } }
+		expect(Value.Price).toBe(1000)
+		expect(((await (await create(undefined)).json()) as { Value: { Price: number } }).Value.Price).toBe(0)
+
+		// The edit is bound the same way, and a refused edit leaves the row as it was.
+		const url = `${ORIGIN}/api/customAvatarItems/v1/${Value.CustomAvatarItemId}`
+		const edit = async (Price: number) =>
+			exports.default.fetch(url, {
+				method: 'PUT',
+				headers: { ...(await bearer('205')), 'content-type': 'application/json' },
+				body: JSON.stringify({ Name: null, Description: null, Price, Accessibility: null }),
+			})
+		const tooMuch = await edit(1001)
+		expect(tooMuch.status).toBe(400)
+		expect(await tooMuch.json()).toMatchObject({ Success: false, Error: 'Price must be <= 1000' })
+		expect((await edit(-1)).status).toBe(400)
+		expect((await getCustomAvatarItem(env.DB, Value.CustomAvatarItemId))!.Price).toBe(1000)
+		const lowered = await edit(999)
+		expect(lowered.status).toBe(200)
+		expect(((await lowered.json()) as { Value: { Price: number } }).Value.Price).toBe(999)
+	})
+
+	// The cap arrived after players had already priced shirts. Migration 0032 lowers every
+	// PLAYER-MADE row over it to exactly the cap and leaves first-party items — priced from the
+	// storefront dump, several above 1000 — alone; the two are told apart by `BaseAvatarItemId`.
+	// Tests build the schema from SCHEMA_DDL rather than the migrations, so the file's UPDATE
+	// is run here by hand.
+	test('migration 0032 lowers existing player-made prices to the cap', async () => {
+		const shirt = (name: string, price: number) =>
+			createCustomAvatarItem(
+				env.DB,
+				{
+					customAvatarItemId: crypto.randomUUID(),
+					creatorAccountId: 205,
+					name,
+					description: '',
+					price,
+					baseAvatarItemId: 1,
+					baseAvatarItemColor: '#fff',
+					accessibility: 1,
+					designFilename: 'd',
+					thumbnailImageFilename: 't',
+				},
+				new Date('2026-08-01T00:00:00Z')
+			)
+		const dear = await shirt('Dear', 5000)
+		const fair = await shirt('Fair', 1000)
+		const cheap = await shirt('Cheap', 50)
+		// A first-party item over the cap: no base item, Coach-authored.
+		const firstPartyId = crypto.randomUUID()
+		await importCustomAvatarItem(env.DB, {
+			CustomAvatarItemId: firstPartyId,
+			RankedEntityId: firstPartyId,
+			CreatorAccountId: 1,
+			Name: 'Studio Wings',
+			Description: null,
+			Price: 6000,
+			Accessibility: 1,
+			OutfitType: 100,
+			BaseAvatarItemId: null,
+			BaseAvatarItemColor: null,
+			DesignFilename: null,
+			ThumbnailImageFilename: null,
+			ForceCannotPublish: false,
+			IsFeatured: false,
+			IsRecRoomApproved: true,
+			PreviewOrientation: 0,
+			RankingContext: null,
+			CreatedAt: '2024-09-26T21:32:48.523Z',
+			ModifiedAt: '2025-02-19T05:19:28.328Z',
+			CurrentSaves: [],
+			Tags: [],
+			CustomBadgeMetadata: null,
+		})
+
+		const statements = priceCapSql
+			.split('\n')
+			.filter((line) => !line.startsWith('--'))
+			.join('\n')
+			.split(';')
+			.map((sql) => sql.trim())
+			.filter(Boolean)
+		expect(statements).toHaveLength(1)
+		await env.DB.prepare(statements[0]!).run()
+
+		const price = async (id: string) => (await getCustomAvatarItem(env.DB, id))!
+		expect((await price(dear.CustomAvatarItemId)).Price).toBe(1000)
+		// The lowered row is marked modified, as an edit would mark it; the untouched ones aren't.
+		expect((await price(dear.CustomAvatarItemId)).ModifiedAt).not.toBe(dear.ModifiedAt)
+		expect(await price(fair.CustomAvatarItemId)).toMatchObject({ Price: 1000, ModifiedAt: fair.ModifiedAt })
+		expect(await price(cheap.CustomAvatarItemId)).toMatchObject({ Price: 50, ModifiedAt: cheap.ModifiedAt })
+		expect((await price(firstPartyId)).Price).toBe(6000)
 	})
 
 	test('DELETE removes the creator’s item and its bucket objects', async () => {
