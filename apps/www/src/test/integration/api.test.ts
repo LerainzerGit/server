@@ -235,6 +235,60 @@ it('treats an unresolvable or half-configured keypair as signup being off', asyn
 	})
 })
 
+// The operator's switch, off by default. `auth` is what enforces it (see its tests); www
+// reads the same knob so the SPA hides the form and the endpoint answers in the sentence
+// the form would show, rather than every visitor learning it from auth's refusal.
+it('PASSWORD_SIGNUP=off reports signup closed and refuses the endpoint', async () => {
+	const original = env.PASSWORD_SIGNUP
+	try {
+		env.PASSWORD_SIGNUP = 'off'
+		const config = (await (await SELF.fetch('https://example.com/api/config')).json()) as {
+			signupEnabled: boolean
+			turnstileSiteKey: string | null
+		}
+		// Closed, and the site key withheld with it: no widget to mount for a form that
+		// isn't offered.
+		expect(config.signupEnabled).toBe(false)
+		expect(config.turnstileSiteKey).toBeNull()
+
+		const res = await SELF.fetch('https://example.com/api/signup', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ password: 'hunter2', turnstileToken: 'XXXX.DUMMY.TOKEN.XXXX' }),
+		})
+		expect(res.status).toBe(403)
+		expect(await res.json()).toEqual({
+			error: 'Account creation from the website is disabled. Launch the game to create an account.',
+		})
+
+		// Unset is off as well.
+		delete env.PASSWORD_SIGNUP
+		const unset = await SELF.fetch('https://example.com/api/signup', {
+			method: 'POST',
+			headers: { 'content-type': 'application/json' },
+			body: JSON.stringify({ password: 'hunter2', turnstileToken: 'XXXX.DUMMY.TOKEN.XXXX' }),
+		})
+		expect(unset.status).toBe(403)
+	} finally {
+		env.PASSWORD_SIGNUP = original
+	}
+})
+
+// auth's own refusal of the grant, should a request reach it anyway, reads the same.
+it('translates auth’s password-signup refusal into the same sentence', async () => {
+	const failure = await readAuthError(
+		new Response(
+			JSON.stringify({ error: 'invalid_grant', error_description: 'password signup is disabled' }),
+			{ status: 400, headers: { 'content-type': 'application/json' } }
+		),
+		'signup'
+	)
+	expect(failure.message).toBe(
+		'Account creation from the website is disabled. Launch the game to create an account.'
+	)
+	expect(failure.status).toBe(400)
+})
+
 it('refuses a signup with no Turnstile token', async () => {
 	const res = await SELF.fetch('https://example.com/api/signup', {
 		method: 'POST',

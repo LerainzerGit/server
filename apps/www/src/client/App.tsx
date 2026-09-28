@@ -2024,6 +2024,14 @@ function LoginPage({
 				) : (
 					<>
 						<h2>Sign in</h2>
+						{/* Someone who arrived at /signup while it's closed gets told so, instead of a
+						    sign-in form appearing where they expected to create an account. Only once
+						    the config has landed: before that, closed is just the not-yet-known state. */}
+						{tab === 'signup' && config && !config.signupEnabled && (
+							<p className="warn">
+								Account creation from the website is disabled. Launch the game to create an account.
+							</p>
+						)}
 						<p className="muted">
 							Use your username and password. Launching the game also creates an account, linked to
 							your Steam ID — set a password on it and it signs in here too.

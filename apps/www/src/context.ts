@@ -67,6 +67,15 @@ export type Env = SharedHonoEnv & {
 	 */
 	MAX_XP_GIFT?: string | number
 	/**
+	 * Whether web signup is open — the same `PASSWORD_SIGNUP` knob `auth` reads to accept
+	 * or refuse a no-platform `create_account`, delivered to both workers by the deploy
+	 * scripts. `on`/`off`; unset means OFF. Read here so `/api/config` can report signup
+	 * closed (the SPA hides the form) and `/api/signup` can refuse with the player-facing
+	 * sentence, instead of every visitor discovering it from auth's refusal. It is a
+	 * courtesy, not the enforcement: auth refuses regardless of what www says.
+	 */
+	PASSWORD_SIGNUP?: string | number | boolean
+	/**
 	 * Service binding to the `auth` worker — how the BFF reaches it, so the browser's real
 	 * IP survives the hop (see wrangler.jsonc and src/upstream.ts `postAuthForm`).
 	 *

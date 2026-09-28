@@ -1076,6 +1076,59 @@ describe('auth worker routes', () => {
 		expect(login.status).toBe(200)
 	})
 
+	test('PASSWORD_SIGNUP=off refuses a no-platform create_account and mints nothing', async () => {
+		// The switch the website's signup hangs off. Every other create_account test here
+		// runs with it ON (see vitest.config.ts); this one is the closed door.
+		const original = env.PASSWORD_SIGNUP
+		try {
+			env.PASSWORD_SIGNUP = 'off'
+			const before = await env.DB.prepare('SELECT COUNT(*) AS n FROM account').first<{
+				n: number
+			}>()
+			const refused = await postToken(
+				'grant_type=create_account&password=hunter2&device_id=dev-web&device_class=2',
+				'198.51.100.60'
+			)
+			expect(refused.status).toBe(400)
+			expect(refused.json.error).toBe('invalid_grant')
+			expect(refused.json.error_description).toBe('password signup is disabled')
+			const after = await env.DB.prepare('SELECT COUNT(*) AS n FROM account').first<{
+				n: number
+			}>()
+			expect(after?.n).toBe(before?.n)
+
+			// Logging in is not what the switch gates: an existing password account still gets
+			// its token, whatever the switch says.
+			const login = await postToken(
+				`grant_type=password&username=Player42&password=${LOGIN_PASSWORD}`,
+				'198.51.100.60'
+			)
+			expect(login.status).toBe(200)
+
+			// A platform signup is a different door: it still reaches platform verification
+			// (and fails THERE, on the missing ticket) rather than being refused by the switch.
+			const steam = await postToken(
+				'grant_type=create_account&platform=0&platform_id=76561198000000001',
+				'198.51.100.60'
+			)
+			expect(steam.status).toBe(400)
+			expect(steam.json.error_description).not.toBe('password signup is disabled')
+
+			// Unset is off too — the default an operator has to opt out of.
+			delete env.PASSWORD_SIGNUP
+			const unset = await postToken('grant_type=create_account&password=hunter2', '198.51.100.61')
+			expect(unset.status).toBe(400)
+			expect(unset.json.error_description).toBe('password signup is disabled')
+
+			// And `on` reopens it.
+			env.PASSWORD_SIGNUP = 'on'
+			const open = await postToken('grant_type=create_account&password=hunter2', '198.51.100.62')
+			expect(open.status).toBe(200)
+		} finally {
+			env.PASSWORD_SIGNUP = original
+		}
+	})
+
 	test('the signup caps come from vars, and 0 disables an arm', async () => {
 		// The cap an operator actually runs is the `MAX_ACCOUNTS_PER_IP` var; the constant in
 		// auth.app.ts is only the fallback. `env` is shared by every test in this file, so the

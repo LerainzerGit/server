@@ -25,6 +25,7 @@ import {
 	writeAuditLog,
 } from '@repo/domain'
 import {
+	flagVar,
 	intVar,
 	logger,
 	withCleanSpec,
@@ -143,6 +144,20 @@ const FAKE_OCULUS_CACHED_LOGIN = {
 const DEFAULT_MAX_ACCOUNTS_PER_PLATFORM_ID = 3
 const DEFAULT_MAX_ACCOUNTS_PER_IP = 3
 const DEFAULT_MAX_ACCOUNTS_PER_DEVICE_ID = 3
+
+/**
+ * Whether a `create_account` with no platform — a password account, which is what the
+ * website mints — is accepted at all (`PASSWORD_SIGNUP`; see context.ts). Off by default:
+ * such an account has no identity but the address it came from, so the caps above are
+ * the only thing limiting it, and a VPN or Tor exit resets the IP arm every N accounts.
+ * That is how one player made 150 accounts in a weekend. A game-client signup always
+ * carries a Steam or Meta identity and is untouched by this switch.
+ *
+ * Refused as `invalid_grant` with this description, which `www` translates for the form
+ * (see its auth-messages.ts) — keep the two in step.
+ */
+const DEFAULT_PASSWORD_SIGNUP = false
+const PASSWORD_SIGNUP_DISABLED_DESCRIPTION = 'password signup is disabled'
 
 /** New players start in the Orientation room (RoomId 13) — the new-user flow. */
 const ORIENTATION_ROOM_ID = 13
@@ -617,7 +632,10 @@ const app = new Hono<App>()
 				'',
 				'**`create_account`** — mints a new account with an auto-assigned random username',
 				'(players do not pick one initially) and places it in the Orientation room. A posted',
-				'`password` becomes the login credential. Subject to three independent signup caps,',
+				'`password` becomes the login credential. Without a `platform` this is a PASSWORD',
+				'account (what the website makes), accepted only while `PASSWORD_SIGNUP` is on —',
+				'off by default, refused as `invalid_grant` "password signup is disabled". Subject',
+				'to three independent signup caps,',
 				'per verified platform id, per signup IP and per client `device_id`',
 				'(`MAX_ACCOUNTS_PER_PLATFORM_ID` / `MAX_ACCOUNTS_PER_IP` / `MAX_ACCOUNTS_PER_DEVICE_ID`;',
 				'any disabled by setting it to 0). If it asserts a',
@@ -762,7 +780,7 @@ const app = new Hono<App>()
 			//   - cached_login authenticates purely by platform identity.
 			//   - create_account that asserts a platform: we won't bind an identity we can't
 			//     prove. (create_account with NO platform is the password-account path —
-			//     allowed, but binds no platformId.)
+			//     binds no platformId, and is open only while PASSWORD_SIGNUP says so.)
 			//
 			// A password grant is NOT gated: the password already proved who it is. It posts
 			// its platform proof too, and if that verifies we LINK the identity to the account
@@ -851,6 +869,17 @@ const app = new Hono<App>()
 			//    via create_account or /account/me/changepassword.
 			let accountId: string
 			if (grantType === 'create_account') {
+				// The password-account path (no platform) is a switch, off by default: see
+				// DEFAULT_PASSWORD_SIGNUP. Checked first, before anything is read or minted —
+				// a closed door costs no D1 round trip and burns no cap slot.
+				if (!platformAsserted && !flagVar(c.env.PASSWORD_SIGNUP, DEFAULT_PASSWORD_SIGNUP)) {
+					logger.info('signup refused: password signup is disabled', { ip: clientIp })
+					return c.json(
+						{ error: 'invalid_grant', error_description: PASSWORD_SIGNUP_DISABLED_DESCRIPTION },
+						400
+					)
+				}
+
 				// A banned player's next move is a new account, so the evasion arms are checked
 				// BEFORE one is minted — against the only identity a signup has, the IP it came
 				// from and the platform identity it just proved. Refusing after the fact (as the

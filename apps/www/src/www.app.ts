@@ -25,7 +25,7 @@ import {
 // it the box one cron run would, so the amount and the box are econ's and not a copy.
 import { DEFAULT_STARTING_TOKENS } from '../../econ/src/balance-db'
 import { grantDiscordRoleGift } from '../../econ/src/discord-role-gift'
-import { authUnreachable } from './auth-messages'
+import { authUnreachable, PASSWORD_SIGNUP_DISABLED } from './auth-messages'
 import {
 	AUTHORIZE_URL,
 	discordConfig,
@@ -58,7 +58,7 @@ import {
 	searchReportsHandler,
 	topReportedHandler,
 } from './staff'
-import { turnstileKeys, verifyTurnstile } from './turnstile'
+import { passwordSignupOpen, turnstileKeys, verifyTurnstile } from './turnstile'
 import {
 	accountsBase,
 	apiBase,
@@ -166,11 +166,16 @@ const app = new Hono<App>()
 	// it calls directly. All three are served rather than baked into the client build so
 	// one build works for any operator. The site key is public (it ships in the widget
 	// markup either way); the secret never leaves the worker.
+	//
+	// Signup is open only when BOTH hold: the operator has switched password signup on
+	// (`PASSWORD_SIGNUP`, the knob auth enforces) and a Turnstile keypair is configured to
+	// guard it. Either missing and the SPA offers no form.
 	.get('/api/config', async (c) => {
 		const [keys, discord] = await Promise.all([turnstileKeys(c.env), discordConfig(c.env)])
+		const signupEnabled = passwordSignupOpen(c.env) && keys !== null
 		return c.json({
-			signupEnabled: keys !== null,
-			turnstileSiteKey: keys?.siteKey ?? null,
+			signupEnabled,
+			turnstileSiteKey: signupEnabled ? keys.siteKey : null,
 			// The benefits claim, on the same terms: open only when it's fully configured, and
 			// the SPA is handed a ready-made consent URL rather than the parts to build one.
 			// Nothing secret is served — the client id inside it is public — and the guild/role
@@ -250,11 +255,16 @@ const app = new Hono<App>()
 
 	// ---- Signup -------------------------------------------------------------
 
-	// Create an account from the website, behind a Turnstile bot check. The check is what
-	// makes this safe to leave open: `auth` binds no platform identity to a web account, so
-	// its per-IP cap (3, never decaying) is the only other thing in front of this path —
-	// and `auth` has no bot check of its own, which is why this one endpoint can't simply
-	// be called from the browser like the rest.
+	// Create an account from the website, behind a Turnstile bot check. `auth` binds no
+	// platform identity to a web account, so its signup caps are the only other thing in
+	// front of this path — and `auth` has no bot check of its own, which is why this one
+	// endpoint can't simply be called from the browser like the rest.
+	//
+	// The whole path is behind the `PASSWORD_SIGNUP` switch, OFF by default: a web account
+	// has no identity but its address, and the per-IP cap is reset by every VPN or Tor exit
+	// (one player made 150 accounts that way in a weekend). `auth` is what enforces the
+	// switch — it refuses the grant whatever this worker does — so the check here only
+	// spares a visitor the Turnstile round trip and answers in the sentence the form shows.
 	//
 	// Deliberately passes NO `platform`: create_account treats an asserted platform as one
 	// to verify against Steam and would reject RecNet, so this is the platform-less
@@ -265,6 +275,7 @@ const app = new Hono<App>()
 	// account's email, when the player gave one, is saved by the client afterwards with
 	// that token — `create_account` takes no email, and `accounts` owns the field.
 	.post('/api/signup', async (c) => {
+		if (!passwordSignupOpen(c.env)) return c.json({ error: PASSWORD_SIGNUP_DISABLED }, 403)
 		// No usable keypair means signup is closed rather than unprotected (see turnstile.ts).
 		const keys = await turnstileKeys(c.env)
 		if (!keys) return c.json({ error: 'Account creation is currently disabled.' }, 403)
