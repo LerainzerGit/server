@@ -765,7 +765,10 @@ export const PublishInventionRequest = z.object({
 		.int()
 		.nullable()
 		.optional()
-		.describe('Price in tokens; null leaves it as it is, and a negative one is ignored'),
+		.describe(
+			'Price in tokens, at most 1000 (MAX_INVENTION_PRICE); null leaves it as it is, a ' +
+				'negative one is ignored, and one over the cap refuses the publish'
+		),
 })
 
 /** `POST /api/inventions/v2/delete` JSON body — the id and nothing else. */
@@ -789,7 +792,7 @@ export const InventionDeleteResult = z.object({
 /** `POST /api/inventions/v1/updateprice` JSON body. */
 export const UpdatePriceRequest = z.object({
 	InventionId: z.int(),
-	Price: z.int().describe('Must be >= 0'),
+	Price: z.int().describe('Tokens, 0–1000 (MAX_INVENTION_PRICE)'),
 })
 
 /** `POST /api/inventions/v6/save` JSON body — camelCase, unlike the read shapes. */

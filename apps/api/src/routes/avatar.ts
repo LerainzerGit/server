@@ -45,6 +45,7 @@ import {
 	inventionDeleteResult,
 	inventionSaveV9Failure,
 	isInventionCheered,
+	MAX_INVENTION_PRICE,
 	normalizeInventionTags,
 	ownsAllInventions,
 	parsePermissionLevel,
@@ -1475,15 +1476,18 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			summary: 'Publish an invention',
 			description:
 				'What puts an invention into search and the feeds. Sets the permission other ' +
-				'players get (defaulting to UseOnly) and its price. Another GET that writes.',
+				'players get (defaulting to UseOnly) and its price. Another GET that writes. A ' +
+				'price over 1000 tokens (`MAX_INVENTION_PRICE`) refuses the whole publish with a ' +
+				'400 rather than being clamped or dropped.',
 			security: AUTHED,
 			parameters: [
 				intQuery('inventionId', 'Invention id; required'),
 				stringQuery('permissionLevel', 'A name like `useonly`, or the raw number'),
-				intQuery('price', 'Price in tokens; negative is ignored'),
+				intQuery('price', 'Price in tokens, at most 1000; negative is ignored'),
 			],
 			responses: {
 				200: json(InventionSaveResult, 'The published invention, in the save envelope'),
+				400: json(ErrorResponse, 'A price over 1000'),
 				401: UNAUTHORIZED_RESPONSE,
 				403: json(ErrorResponse, 'Not the caller’s invention'),
 				404: { description: 'No such invention' },
@@ -1495,6 +1499,8 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 
 			const permissionLevel = c.req.query('permissionLevel')
 			const price = Number.parseInt(c.req.query('price') ?? '', 10)
+			if (price > MAX_INVENTION_PRICE)
+				return c.json({ error: `Price must be <= ${MAX_INVENTION_PRICE}` }, 400)
 
 			const published = await publishInvention(c.env.DB, gate.invention.InventionId, {
 				permissionLevel:
@@ -1514,12 +1520,12 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			summary: 'Set an invention’s price',
 			description:
 				'Unlike update/publish, this one POSTs a JSON body. Creator only; a negative price ' +
-				'is rejected.',
+				'is rejected, as is one over 1000 tokens (`MAX_INVENTION_PRICE`).',
 			security: AUTHED,
 			requestBody: jsonBody(UpdatePriceRequest, 'The invention and its new price'),
 			responses: {
 				200: json(InventionSaveResult, 'The repriced invention, in the save envelope'),
-				400: json(ErrorResponse, 'Unparseable body, or a price below 0'),
+				400: json(ErrorResponse, 'Unparseable body, or a price below 0 or over 1000'),
 				401: UNAUTHORIZED_RESPONSE,
 				403: json(ErrorResponse, 'Not the caller’s invention'),
 				404: { description: 'No such invention' },
@@ -1535,6 +1541,8 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 
 			const price = typeof body.Price === 'number' ? body.Price : Number.NaN
 			if (Number.isNaN(price) || price < 0) return c.json({ error: 'Price must be >= 0' }, 400)
+			if (price > MAX_INVENTION_PRICE)
+				return c.json({ error: `Price must be <= ${MAX_INVENTION_PRICE}` }, 400)
 
 			const updated = await setInventionPrice(c.env.DB, gate.invention.InventionId, price)
 			return updated === null ? c.notFound() : c.json(toSaveResult(updated))
@@ -2266,7 +2274,8 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 				'keeps it out of browse and search. A null `Price` leaves the price alone rather ' +
 				'than zeroing it, so re-publishing something that was for sale doesn’t give it ' +
 				'away; every field but `InventionId` is nullable and an omitted one keeps what ' +
-				'the invention has.\n\n' +
+				'the invention has. A price over 1000 tokens (`MAX_INVENTION_PRICE`) refuses the ' +
+				'publish in-band.\n\n' +
 				'Publishing is not undone here, and re-publishing doesn’t re-date the first ' +
 				'publish. Refusals answer `Success: false` with a null `Value`, the way ' +
 				'`v9/save` does.',
@@ -2304,6 +2313,8 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			const int = (key: string): number | undefined =>
 				typeof body[key] === 'number' && Number.isInteger(body[key]) ? body[key] : undefined
 			const price = int('Price')
+			if (price !== undefined && price > MAX_INVENTION_PRICE)
+				return c.json(inventionSaveV9Failure(`Price must be <= ${MAX_INVENTION_PRICE}`))
 
 			const published = await publishInvention(c.env.DB, gate.invention.InventionId, {
 				permissionLevel: int('Permission'),

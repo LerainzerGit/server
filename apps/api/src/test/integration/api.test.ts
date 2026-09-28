@@ -39,6 +39,7 @@ import {
 	THREAD_SCHEMA_DDL,
 } from '../../../../chat/src/thread-db'
 import priceCapSql from '../../../migrations/0032_custom_avatar_item_price_cap.sql?raw'
+import inventionPriceCapSql from '../../../migrations/0033_invention_price_cap.sql?raw'
 import { banEvasionMatch, resolveBan } from '../../bans-db'
 import {
 	createCustomAvatarItem,
@@ -54,7 +55,7 @@ import {
 	getEventAttendees,
 	getEventResponse,
 } from '../../events-db'
-import { SCHEMA_DDL as INVENTIONS_SCHEMA_DDL } from '../../inventions-db'
+import { SCHEMA_DDL as INVENTIONS_SCHEMA_DDL, MAX_INVENTION_PRICE } from '../../inventions-db'
 import {
 	banFromReport,
 	createReport,
@@ -2863,6 +2864,20 @@ describe('public endpoints', () => {
 		// A negative price is dropped rather than stored.
 		expect((await publish({ Price: -5 })).Price).toBe(250)
 
+		// One over the cap refuses the publish in-band, and the price stands.
+		const over = await exports.default.fetch(`${ORIGIN}/api/inventions/v4/publish`, {
+			method: 'POST',
+			headers: { ...(await bearer('5172')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: inventionId, Price: 1001 }),
+		})
+		expect(over.status).toBe(200)
+		expect(await over.json()).toMatchObject({
+			Success: false,
+			Value: null,
+			Error: 'Price must be <= 1000',
+		})
+		expect((await publish({ Price: 1000 })).Price).toBe(1000)
+
 		// Out of the published catalogue again — see the note in the publish test above.
 		await env.DB.prepare('DELETE FROM invention WHERE id = ?1').bind(inventionId).run()
 	})
@@ -4140,6 +4155,21 @@ describe('public endpoints', () => {
 
 		expect(await search()).toEqual([Invention.InventionId])
 
+		// A price over the cap refuses the whole publish, leaving the invention as it was.
+		const over = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v3/publish?inventionId=${Invention.InventionId}&price=1001`,
+			{ headers: await bearer('2121') }
+		)
+		expect(over.status).toBe(400)
+		expect(await over.json()).toEqual({ error: 'Price must be <= 1000' })
+		expect(
+			(await env.DB.prepare(
+				`SELECT json_extract(data, '$.Price') AS price FROM invention WHERE id = ?1`
+			)
+				.bind(Invention.InventionId)
+				.first<{ price: number }>())!.price
+		).toBe(250)
+
 		// Publishing with no permissionLevel defaults to UseOnly, and price to 0.
 		const other = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
 			method: 'POST',
@@ -4192,6 +4222,59 @@ describe('public endpoints', () => {
 		expect(
 			(await updateprice({ InventionId: Invention.InventionId, Price: 10 }, '9999')).status
 		).toBe(403)
+
+		// Capped at MAX_INVENTION_PRICE, inclusive: one over is refused and the price stands.
+		expect(MAX_INVENTION_PRICE).toBe(1000)
+		const over = await updateprice({ InventionId: Invention.InventionId, Price: 1001 })
+		expect(over.status).toBe(400)
+		expect(await over.json()).toEqual({ error: 'Price must be <= 1000' })
+		const atCap = await updateprice({ InventionId: Invention.InventionId, Price: 1000 })
+		expect(atCap.status).toBe(200)
+		expect(((await atCap.json()) as InventionSaveResult).Invention.Price).toBe(1000)
+	})
+
+	// The cap arrived after creators had priced inventions. Migration 0033 lowers every row
+	// over it to exactly the cap, published or not, and leaves the rest alone. Tests build the
+	// schema from SCHEMA_DDL rather than the migrations, so the file's UPDATE is run by hand.
+	test('migration 0033 lowers existing invention prices to the cap', async () => {
+		const make = async (name: string, price: number): Promise<number> => {
+			const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
+				method: 'POST',
+				headers: { ...(await bearer('1213')), 'Content-Type': 'application/json' },
+				body: JSON.stringify({ name, inventionDataFilename: 'a.inv' }),
+			})
+			const id = ((await save.json()) as InventionSaveResult).Invention.InventionId
+			// Written straight into the row: no endpoint will store this any more.
+			await env.DB.prepare(
+				`UPDATE invention SET data = json_set(data, '$.Price', ?2) WHERE id = ?1`
+			)
+				.bind(id, price)
+				.run()
+			return id
+		}
+		const dear = await make('Dear Lamp', 25000)
+		const fair = await make('Fair Lamp', 1000)
+		const cheap = await make('Cheap Lamp', 50)
+
+		const statements = inventionPriceCapSql
+			.split('\n')
+			.filter((line) => !line.startsWith('--'))
+			.join('\n')
+			.split(';')
+			.map((sql) => sql.trim())
+			.filter(Boolean)
+		expect(statements).toHaveLength(1)
+		await env.DB.prepare(statements[0]!).run()
+
+		const price = async (id: number): Promise<number> =>
+			(await env.DB.prepare(
+				`SELECT json_extract(data, '$.Price') AS price FROM invention WHERE id = ?1`
+			)
+				.bind(id)
+				.first<{ price: number }>())!.price
+		expect(await price(dear)).toBe(1000)
+		expect(await price(fair)).toBe(1000)
+		expect(await price(cheap)).toBe(50)
 	})
 
 	test('GET /api/inventions/v1/fromcreators is an empty feed for now', async () => {
