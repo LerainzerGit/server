@@ -38,6 +38,7 @@ import {
 	SYSTEM_SENDER_ID,
 	THREAD_SCHEMA_DDL,
 } from '../../../../chat/src/thread-db'
+import priceCapSql from '../../../migrations/0032_custom_avatar_item_price_cap.sql?raw'
 import { banEvasionMatch, resolveBan } from '../../bans-db'
 import {
 	createCustomAvatarItem,
@@ -47,7 +48,6 @@ import {
 	MAX_PLAYER_ITEM_PRICE,
 } from '../../custom-avatar-items-db'
 import { customAvatarItemRowLiteral } from '../../custom-avatar-items-load'
-import priceCapSql from '../../../migrations/0032_custom_avatar_item_price_cap.sql?raw'
 import {
 	countGoing,
 	SCHEMA_DDL as EVENTS_SCHEMA_DDL,
@@ -4639,7 +4639,9 @@ describe('custom avatar items', () => {
 		expect((await create(10.5)).status).toBe(400)
 		// Nothing was written for the refused ones.
 		expect(
-			await env.DB.prepare(`SELECT count(*) AS n FROM custom_avatar_item WHERE name_lower = 'pricey'`)
+			await env.DB.prepare(
+				`SELECT count(*) AS n FROM custom_avatar_item WHERE name_lower = 'pricey'`
+			)
 				.first<{ n: number }>()
 				.then((r) => r!.n)
 		).toBe(0)
@@ -4647,9 +4649,13 @@ describe('custom avatar items', () => {
 		// The cap itself is allowed, inclusive; a missing price is still 0.
 		const atCap = await create(1000)
 		expect(atCap.status).toBe(200)
-		const { Value } = (await atCap.json()) as { Value: { CustomAvatarItemId: string; Price: number } }
+		const { Value } = (await atCap.json()) as {
+			Value: { CustomAvatarItemId: string; Price: number }
+		}
 		expect(Value.Price).toBe(1000)
-		expect(((await (await create(undefined)).json()) as { Value: { Price: number } }).Value.Price).toBe(0)
+		expect(
+			((await (await create(undefined)).json()) as { Value: { Price: number } }).Value.Price
+		).toBe(0)
 
 		// The edit is bound the same way, and a refused edit leaves the row as it was.
 		const url = `${ORIGIN}/api/customAvatarItems/v1/${Value.CustomAvatarItemId}`
@@ -4702,7 +4708,7 @@ describe('custom avatar items', () => {
 			RankedEntityId: firstPartyId,
 			CreatorAccountId: 1,
 			Name: 'Studio Wings',
-			Description: null,
+			Description: '',
 			Price: 6000,
 			Accessibility: 1,
 			OutfitType: 100,
@@ -4736,8 +4742,14 @@ describe('custom avatar items', () => {
 		expect((await price(dear.CustomAvatarItemId)).Price).toBe(1000)
 		// The lowered row is marked modified, as an edit would mark it; the untouched ones aren't.
 		expect((await price(dear.CustomAvatarItemId)).ModifiedAt).not.toBe(dear.ModifiedAt)
-		expect(await price(fair.CustomAvatarItemId)).toMatchObject({ Price: 1000, ModifiedAt: fair.ModifiedAt })
-		expect(await price(cheap.CustomAvatarItemId)).toMatchObject({ Price: 50, ModifiedAt: cheap.ModifiedAt })
+		expect(await price(fair.CustomAvatarItemId)).toMatchObject({
+			Price: 1000,
+			ModifiedAt: fair.ModifiedAt,
+		})
+		expect(await price(cheap.CustomAvatarItemId)).toMatchObject({
+			Price: 50,
+			ModifiedAt: cheap.ModifiedAt,
+		})
 		expect((await price(firstPartyId)).Price).toBe(6000)
 	})
 

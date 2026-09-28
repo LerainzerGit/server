@@ -2816,12 +2816,17 @@ describe('econ endpoints', () => {
 				listing.PurchasableItemId
 			)
 			// A skin's or a consumable's thumbnail is blanked — the dump names a PNG per item that
-			// this server does not have — and nothing else about a drop changes.
+			// this server does not have — and a drop with Context -1 (the hair dyes and the dice
+			// skins) is served with Context 0. Nothing else about a drop changes.
 			const blanked =
 				listing.GiftDrop.EquipmentModificationGuid !== '' ||
 				listing.GiftDrop.ConsumableItemDesc !== ''
+			const expectedDrop = {
+				...listing.GiftDrop,
+				Context: listing.GiftDrop.Context === -1 ? 0 : listing.GiftDrop.Context,
+			}
 			expect(served.GiftDrop).toEqual(
-				blanked ? { ...listing.GiftDrop, ThumbnailImageName: '' } : listing.GiftDrop
+				blanked ? { ...expectedDrop, ThumbnailImageName: '' } : expectedDrop
 			)
 			// The other edit to a listing: the dump was taken mid-sale (80% off nearly everything,
 			// no end date), and the client posts the sale price it computes — which this server,
@@ -2865,7 +2870,7 @@ describe('econ endpoints', () => {
 		expect(skinsJson.every((sk) => soldGuids.includes(sk.ModificationGuid))).toBe(true)
 		expect(soldSkins.every((i) => i.GiftDrop.ThumbnailImageName === '')).toBe(true)
 		expect(soldSkins.length).toBeGreaterThan(unlisted.length)
-		// A "(Gold)" skin — thirteen, all from the capture — is a prestige item: 1,000,000 tokens,
+		// A "(Gold)" skin — thirteen, all from the capture — is a prestige item: 5,000,000 tokens,
 		// the same for a subscriber, no sale. A "(Gold)" AVATAR item is priced as the dump has it.
 		const goldSkins = soldSkins.filter((i) => i.GiftDrop.FriendlyName.includes('(Gold)'))
 		expect(goldSkins.length).toBeGreaterThan(10)

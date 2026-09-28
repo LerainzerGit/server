@@ -361,7 +361,11 @@ export const CheerPlayerResponse = z.object({
 export const CreateCustomAvatarItemMetadata = z.object({
 	Name: z.string(),
 	Description: z.string().optional(),
-	Price: z.number().int().min(0).max(1000).optional().describe('Tokens, 0–1000; 0 when left out'),
+	Price: z
+		.number()
+		.int()
+		.optional()
+		.describe('Tokens, 0–1000 (MAX_PLAYER_ITEM_PRICE); 0 when left out'),
 	BaseAvatarItemId: z.number().int(),
 	BaseAvatarItemColor: z.string().describe('Hex colour, e.g. `#F55C1A`'),
 	Accessibility: z.number().int().optional(),
@@ -434,7 +438,7 @@ export const CustomAvatarItemDto = z.object({
 export const UpdateCustomAvatarItemRequest = z.object({
 	Name: z.string().nullable().optional(),
 	Description: z.string().nullable().optional(),
-	Price: z.number().int().min(0).max(1000).nullable().optional().describe('Tokens, 0–1000'),
+	Price: z.number().int().nullable().optional().describe('Tokens, 0–1000 (MAX_PLAYER_ITEM_PRICE)'),
 	Accessibility: z.number().int().nullable().optional(),
 })
 
