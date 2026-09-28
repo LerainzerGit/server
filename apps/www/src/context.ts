@@ -46,6 +46,16 @@ export type Env = SharedHonoEnv & {
 	 */
 	STARTING_TOKENS?: string | number
 	/**
+	 * The Discord supporter gift's role map — `<roleId>=<tokens>` pairs — the same knob
+	 * `econ`'s cron reads, injected into every worker from RECFLARE_DISCORD_ROLE_TOKENS at
+	 * deploy. www reads it for ONE grant: the first time an account links its Discord through
+	 * the benefits claim, it is boxed the amount its role would earn from one cron run, so a
+	 * new supporter isn't waiting a whole schedule for their first gift (see
+	 * `grantDiscordRoleGift` in econ's discord-role-gift.ts, which does the paying). Unset —
+	 * or mapping none of the member's roles — awards nothing and the claim proceeds as before.
+	 */
+	DISCORD_ROLE_TOKENS?: string
+	/**
 	 * The most RecCenterTokens one staff token gift can carry (see src/staff.ts). A typo guard
 	 * rather than a policy, since a credit can't be taken back. Unset means
 	 * DEFAULT_MAX_TOKEN_GIFT (10,000).

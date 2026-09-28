@@ -5,7 +5,7 @@ import { getAccount, updateAccount } from '@repo/domain/src/accounts-db'
 import { PlatformType } from '@repo/domain/src/enums'
 import { countOnlinePlayers } from '@repo/domain/src/presence-db'
 import { getStatSeries } from '@repo/domain/src/stats-db'
-import { logger, withDefaultCors, withOnError } from '@repo/hono-helpers'
+import { intVar, logger, withDefaultCors, withOnError } from '@repo/hono-helpers'
 import { validateAndGetAccountId } from '@repo/jwt'
 
 // The `platform_account` link table, owned (and migrated) by the `auth` worker. A claimed
@@ -20,6 +20,11 @@ import {
 	isPlatformIdentityLinked,
 	linkPlatformIdentity,
 } from '../../auth/src/platform-db'
+// The signup grant's default and the Discord supporter gift, both `econ`'s. The gift is
+// econ's cron paid on demand: the first time an account links its Discord, the claim hands
+// it the box one cron run would, so the amount and the box are econ's and not a copy.
+import { DEFAULT_STARTING_TOKENS } from '../../econ/src/balance-db'
+import { grantDiscordRoleGift } from '../../econ/src/discord-role-gift'
 import { authUnreachable } from './auth-messages'
 import {
 	AUTHORIZE_URL,
@@ -363,6 +368,13 @@ const app = new Hono<App>()
 	 * That's deliberate for now — a sweep would need a bot token to enumerate the guild,
 	 * which this design specifically avoids — but it does mean the flag records "held the
 	 * role once", not "holds it today".
+	 *
+	 * The FIRST time an account links a Discord, the claim also pays the supporter gift
+	 * econ's cron would (`DISCORD_ROLE_TOKENS`, the amount for the best of the roles just
+	 * read) — once, so a new supporter isn't waiting a whole schedule for their first box.
+	 * "First" means the account had no Discord link at all before this claim: a re-claim,
+	 * and a claim that swaps in a second Discord identity, both pay nothing. The response's
+	 * `tokensAwarded` says what was paid (null when nothing was).
 	 */
 	.post('/api/benefits/claim', async (c) => {
 		const config = await discordConfig(c.env)
@@ -419,6 +431,12 @@ const app = new Hono<App>()
 			PlatformType.Discord,
 			membership.userId
 		)
+		// Whether this claim is the account's FIRST Discord link — what the one-time gift below
+		// keys on. Decided before the write, from the table: an account re-claiming with the
+		// same Discord is not first (`alreadyMine`), and neither is one that already carries a
+		// DIFFERENT Discord identity, which the once-only guard doesn't stop. Only asked when
+		// it could be true, to spare the re-claim a query.
+		let firstLink = false
 		if (!alreadyMine) {
 			const claimedElsewhere = await countAccountsForPlatformIdentity(
 				c.env.DB,
@@ -434,6 +452,8 @@ const app = new Hono<App>()
 					409
 				)
 			}
+			const links = await getLinksForAccount(c.env.DB, accountId)
+			firstLink = !links.some((link) => link.platform === PlatformType.Discord)
 		}
 
 		// Both writes are idempotent: the link is INSERT OR IGNORE (so `linkedAt` keeps the
@@ -446,7 +466,7 @@ const app = new Hono<App>()
 		// under a role that has since been retired from the config. Roles are the one part of
 		// the row a re-claim REFRESHES, because they're a snapshot of a membership that moves
 		// and this reading is the fresher one.
-		await linkPlatformIdentity(
+		const created = await linkPlatformIdentity(
 			c.env.DB,
 			accountId,
 			PlatformType.Discord,
@@ -456,9 +476,40 @@ const app = new Hono<App>()
 		await updateAccount(c.env.DB, accountId, { hasPlus: true })
 		logger.info('granted plus from a discord benefits claim', { accountId })
 
+		// The one-time supporter gift: the box econ's cron would hand this member, paid now,
+		// once. Gated on the insert having happened too (`created`), so two claims racing on
+		// one fresh account can't both pay. Best-effort AFTER Plus is granted and the link is
+		// written: a grant that fails partway is logged with what to check, as econ's cron
+		// logs its own, and the claim still answers — the player got what they came for, and
+		// a retry that also failed partway is how a balance gets credited twice.
+		let tokensAwarded: number | null = null
+		if (created && firstLink) {
+			try {
+				const role = await grantDiscordRoleGift(
+					c.env,
+					accountId,
+					membership.roles,
+					intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
+				)
+				if (role !== null) {
+					tokensAwarded = role.tokens
+					logger.info('awarded the discord role gift on a first link', {
+						accountId,
+						roleId: role.roleId,
+						tokens: role.tokens,
+					})
+				}
+			} catch (err) {
+				logger.error('the discord role gift on a first link failed partway', {
+					accountId,
+					error: err instanceof Error ? err.message : String(err),
+				})
+			}
+		}
+
 		// The username is echoed for the confirmation line only — it is never stored, and a
 		// Discord member who has since renamed themselves is not a problem to solve here.
-		return c.json({ hasPlus: true, discordUsername: membership.username })
+		return c.json({ hasPlus: true, discordUsername: membership.username, tokensAwarded })
 	})
 
 	// ---- Staff moderation panel ---------------------------------------------

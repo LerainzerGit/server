@@ -56,6 +56,10 @@ import {
 } from '../../../../econ/src/balance-db'
 import { CATALOG_SCHEMA_DDL } from '../../../../econ/src/catalog-db'
 import { CONSUMABLE_SCHEMA_DDL, getConsumables } from '../../../../econ/src/consumables-db'
+import {
+	DISCORD_ROLE_GIFT_MESSAGE,
+	grantDiscordRoleGift,
+} from '../../../../econ/src/discord-role-gift'
 import { EQUIPMENT_SCHEMA_DDL, getEquipment } from '../../../../econ/src/equipment-db'
 import {
 	grantCustomAvatarItem,
@@ -656,6 +660,64 @@ it('tells a repeat claim from a second account claiming the same discord identit
 // gate; this pins that the platform www writes to is one the gate actually excludes.
 it('stores the discord identity on a platform the login picker will not list', () => {
 	expect(CACHED_LOGIN_PLATFORMS).not.toContain(PlatformType.Discord)
+})
+
+// The one-time supporter gift the claim pays on an account's FIRST Discord link: econ's
+// cron grant, called on demand with the roles Discord just served, against www's own
+// bindings. Exercised at the grant, since the route's path to it runs through discord.com;
+// the claim decides "first" from the link table before it writes (see www.app.ts).
+it('pays the discord role gift once, on demand, from www’s bindings', async () => {
+	const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+	await hub().fetch('http://do/all', { method: 'DELETE' })
+	const supporter = '1077000000000000001'
+	const booster = '1077000000000000002'
+	const giftEnv = { ...env, DISCORD_ROLE_TOKENS: `${supporter}=2500,${booster}=10000` } as Env
+
+	// No map, or a member holding no mapped role: nothing is paid and nothing is written.
+	await expect(
+		grantDiscordRoleGift({ ...env, DISCORD_ROLE_TOKENS: undefined } as Env, 4010, [supporter], 100)
+	).resolves.toBeNull()
+	await expect(
+		grantDiscordRoleGift(giftEnv, 4010, ['1077000000000000009'], 100)
+	).resolves.toBeNull()
+	expect(await getPendingGifts(env.DB, 4010)).toEqual([])
+	expect(await (await hub().fetch('http://do/all')).json()).toEqual([])
+
+	// The best of the member's mapped roles pays — one box, on top of the signup grant, which
+	// is seeded first so a never-touched balance doesn't start from the gift alone.
+	await expect(
+		grantDiscordRoleGift(giftEnv, 4010, [supporter, booster], DEFAULT_STARTING_TOKENS)
+	).resolves.toEqual({ roleId: booster, tokens: 10000 })
+	await expect(
+		getBalance(env.DB, 4010, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+	).resolves.toBe(DEFAULT_STARTING_TOKENS + 10000)
+	const gifts = await getPendingGifts(env.DB, 4010)
+	expect(gifts).toHaveLength(1)
+	expect(gifts[0]).toMatchObject({
+		FromPlayerId: 1,
+		CurrencyType: CurrencyType.RecCenterTokens,
+		Currency: 10000,
+		AvatarItemType: null,
+		Message: DISCORD_ROLE_GIFT_MESSAGE,
+	})
+
+	// Announced through www's hub binding exactly as econ's cron announces it: the resulting
+	// total into the -2 bucket, then the box.
+	const frames = (await (await hub().fetch('http://do/all')).json()) as Array<{
+		playerId: number
+		notificationType: number
+		data: Record<string, unknown>
+	}>
+	expect(frames.map((f) => [f.playerId, f.notificationType])).toEqual([
+		[4010, 61],
+		[4010, 31],
+	])
+	expect(frames[0].data).toEqual({
+		Balance: DEFAULT_STARTING_TOKENS + 10000,
+		CurrencyType: CurrencyType.RecCenterTokens,
+		Platform: -2,
+	})
+	expect(frames[1].data).toMatchObject({ Id: gifts[0]!.Id, Currency: 10000, BalanceType: -2 })
 })
 
 // The privacy policy is what the Meta Horizon Store's VRC.Privacy.1–4 checks are run

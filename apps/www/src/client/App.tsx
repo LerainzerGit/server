@@ -493,9 +493,20 @@ interface BenefitsStatus {
 const fetchBenefitsStatus = (): Promise<BenefitsStatus> =>
 	call<BenefitsStatus>('/api/benefits/status', { authed: true })
 
+/** What a successful claim answers. */
+interface ClaimResult {
+	discordUsername?: string
+	/**
+	 * The supporter gift paid on this claim — the tokens the server hands a linked role once,
+	 * the FIRST time an account links its Discord. Null on a re-claim, when no role is mapped
+	 * to a gift, or when the server doesn't run one.
+	 */
+	tokensAwarded?: number | null
+}
+
 /** Redeem the code Discord sent us back with. The access token never reaches this page. */
-const claimBenefits = (code: string): Promise<{ discordUsername?: string }> =>
-	call<{ discordUsername?: string }>('/api/benefits/claim', { json: { code }, authed: true })
+const claimBenefits = (code: string): Promise<ClaimResult> =>
+	call<ClaimResult>('/api/benefits/claim', { json: { code }, authed: true })
 
 /**
  * The per-attempt CSRF nonce for the Discord round-trip, in sessionStorage.
@@ -695,11 +706,15 @@ function BenefitsPanel({ account, config }: { account: SelfAccount; config: Site
 		claimBenefits(code)
 			.then((result) => {
 				setStatus({ hasPlus: true, linked: true })
-				setDone(
-					result.discordUsername
-						? `Verified as ${result.discordUsername} — Rec Room Plus is now on your account.`
-						: 'Verified — Rec Room Plus is now on your account.'
-				)
+				const verified = result.discordUsername
+					? `Verified as ${result.discordUsername} — Rec Room Plus is now on your account.`
+					: 'Verified — Rec Room Plus is now on your account.'
+				// The first-link gift, when one was paid: it's sitting in a box in the game, and
+				// the player would otherwise only find it by opening their gifts.
+				const gift = result.tokensAwarded
+					? ` A welcome gift of ${result.tokensAwarded.toLocaleString()} tokens is waiting in your gift boxes.`
+					: ''
+				setDone(verified + gift)
 				setRelogin(true)
 			})
 			.catch((err: unknown) => setError(err instanceof Error ? err.message : String(err)))

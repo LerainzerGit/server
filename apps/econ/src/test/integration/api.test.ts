@@ -91,6 +91,7 @@ import { buildRotation, rotationIndex, withWeeklyGift } from '../../challenge-ro
 import { CONSUMABLE_SCHEMA_DDL, grantConsumable } from '../../consumables-db'
 import {
 	DISCORD_ROLE_GIFT_MESSAGE,
+	grantDiscordRoleGift,
 	grantDiscordRoleGifts,
 	parseRoleTokens,
 } from '../../discord-role-gift'
@@ -6795,6 +6796,30 @@ describe('discord role gift', () => {
 			},
 		])
 		expect(frames.map((f) => f.accountId)).toEqual([9311, 9311, 9312, 9312, 9313, 9313])
+	})
+
+	// The same grant, paid to ONE account on demand: what `www`'s benefits claim calls on an
+	// account's first Discord link, with the roles Discord just served rather than a stored
+	// link. Same map, same best-role pick, same box; null — and no writes — when nothing maps.
+	test('pays one account its role’s gift on demand', async () => {
+		await onlyDiscordLinks([])
+		await drainFrames()
+		await expect(grantDiscordRoleGift(giftEnv(undefined), 9331, [ROLE_A], 100)).resolves.toBeNull()
+		await expect(grantDiscordRoleGift(giftEnv(MAP), 9331, [UNMAPPED], 100)).resolves.toBeNull()
+		expect(await getPendingGifts(env.DB, 9331)).toEqual([])
+		expect(await drainFrames()).toEqual([])
+
+		await expect(
+			grantDiscordRoleGift(giftEnv(MAP), 9331, [ROLE_A, ROLE_B], DEFAULT_STARTING_TOKENS)
+		).resolves.toEqual({ roleId: ROLE_B, tokens: 10000 })
+		expect(await tokens(9331)).toBe(DEFAULT_STARTING_TOKENS + 10000)
+		expect(await getPendingGifts(env.DB, 9331)).toMatchObject([
+			{ Currency: 10000, AvatarItemType: null, Message: DISCORD_ROLE_GIFT_MESSAGE },
+		])
+		expect((await drainFrames()).map((f) => [f.accountId, f.notificationType])).toEqual([
+			[9331, NotificationType.StorefrontBalanceUpdate],
+			[9331, NotificationType.GiftPackageReceivedImmediate],
+		])
 	})
 
 	test('every run pays again — the schedule is the cadence — and a lapsed role is not paid', async () => {
