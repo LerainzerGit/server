@@ -4,6 +4,7 @@ import { useWorkersLogger } from 'workers-tagged-logger'
 import { z } from 'zod'
 
 import {
+	countAccountsByDeviceId,
 	countAccountsBySignupIp,
 	createAccount,
 	GAME_VERSION,
@@ -116,24 +117,32 @@ const FAKE_OCULUS_CACHED_LOGIN = {
  * Signup caps, enforced on create_account only (never on login — an existing account
  * always stays reachable, however many accounts its owner has since accumulated).
  *
- * Two independent arms, because they fail in opposite ways:
+ * Three independent arms, because they fail in different ways:
  *  - Per verified platform id (a Steam-proven SteamID64). The sharp one: it can't be
  *    spoofed and can't be reset by changing networks. Only binds on a platform
  *    create_account — the password/anonymous path has no platform identity to count,
- *    so the IP arm is the only thing standing between it and bulk signup.
+ *    so the other two arms are all that stands between it and bulk signup.
  *  - Per signup IP. Coarse: households, NAT and shared campus/mobile networks put many
  *    legitimate players behind one address, so this WILL be the arm that produces false
  *    positives. It counts `signupIp` (immutable), so an abuser can't reset their own
- *    count by hopping networks.
+ *    count by hopping networks — but a VPN gives them a fresh counter per exit, which
+ *    is exactly how one player made 150 accounts, six per address, in a weekend.
+ *  - Per client device id. Narrower than an IP (a household shares an address, not an
+ *    install) and stable across VPN hops, which is the hole in the IP arm it covers. It
+ *    counts the last-seen `deviceId`, which a login moves; see the field's notes in
+ *    accounts-db for why an immutable copy isn't worth keeping. Client-chosen and
+ *    unverified, so it catches a stock client, not a script that fabricates ids. Skipped
+ *    when the signup posts no `device_id` (the website's don't).
  *
- * These are the defaults. An operator overrides either arm with the matching worker var
- * (`MAX_ACCOUNTS_PER_PLATFORM_ID` / `MAX_ACCOUNTS_PER_IP` in wrangler.jsonc `vars`), and
- * setting one to 0 disables that arm entirely — which a small private server that trusts
- * everyone it invites will want, and which the IP arm in particular is worth reaching for
- * if a shared network is being locked out.
+ * These are the defaults. An operator overrides any arm with the matching worker var
+ * (`MAX_ACCOUNTS_PER_PLATFORM_ID` / `MAX_ACCOUNTS_PER_IP` / `MAX_ACCOUNTS_PER_DEVICE_ID`
+ * in wrangler.jsonc `vars`), and setting one to 0 disables that arm entirely — which a
+ * small private server that trusts everyone it invites will want, and which the IP arm in
+ * particular is worth reaching for if a shared network is being locked out.
  */
 const DEFAULT_MAX_ACCOUNTS_PER_PLATFORM_ID = 3
 const DEFAULT_MAX_ACCOUNTS_PER_IP = 3
+const DEFAULT_MAX_ACCOUNTS_PER_DEVICE_ID = 3
 
 /** New players start in the Orientation room (RoomId 13) — the new-user flow. */
 const ORIENTATION_ROOM_ID = 13
@@ -608,9 +617,10 @@ const app = new Hono<App>()
 				'',
 				'**`create_account`** — mints a new account with an auto-assigned random username',
 				'(players do not pick one initially) and places it in the Orientation room. A posted',
-				'`password` becomes the login credential. Subject to two independent signup caps,',
-				'per verified platform id and per signup IP (`MAX_ACCOUNTS_PER_PLATFORM_ID` /',
-				'`MAX_ACCOUNTS_PER_IP`; either disabled by setting it to 0). If it asserts a',
+				'`password` becomes the login credential. Subject to three independent signup caps,',
+				'per verified platform id, per signup IP and per client `device_id`',
+				'(`MAX_ACCOUNTS_PER_PLATFORM_ID` / `MAX_ACCOUNTS_PER_IP` / `MAX_ACCOUNTS_PER_DEVICE_ID`;',
+				'any disabled by setting it to 0). If it asserts a',
 				'`platform`, that platform must be verifiable (Steam or Meta) and its `platform_auth`',
 				'must verify.',
 				'',
@@ -872,7 +882,7 @@ const app = new Hono<App>()
 
 				// Signup caps. Checked before minting anything, so a rejected signup leaves no
 				// account behind. Each arm is skipped when it's disabled (var <= 0) or when its
-				// identity is unknown (no verified platform id / no client IP) — an unattributable
+				// identity is unknown (no verified platform id / no client IP / no device id) — an unattributable
 				// signup can't be counted against anyone, and lumping them together would lock out
 				// real players. The disabled check comes first so a disabled arm costs no D1 read.
 				const maxPerPlatformId = intVar(
@@ -880,6 +890,10 @@ const app = new Hono<App>()
 					DEFAULT_MAX_ACCOUNTS_PER_PLATFORM_ID
 				)
 				const maxPerIp = intVar(c.env.MAX_ACCOUNTS_PER_IP, DEFAULT_MAX_ACCOUNTS_PER_IP)
+				const maxPerDeviceId = intVar(
+					c.env.MAX_ACCOUNTS_PER_DEVICE_ID,
+					DEFAULT_MAX_ACCOUNTS_PER_DEVICE_ID
+				)
 				if (
 					maxPerPlatformId > 0 &&
 					verifiedPlatformId !== null &&
@@ -910,6 +924,20 @@ const app = new Hono<App>()
 						{
 							error: 'invalid_grant',
 							error_description: 'too many accounts created from this network',
+						},
+						400
+					)
+				}
+				if (
+					maxPerDeviceId > 0 &&
+					deviceId !== '' &&
+					(await countAccountsByDeviceId(c.env.DB, deviceId)) >= maxPerDeviceId
+				) {
+					logger.info('signup rejected: per-device account limit', { deviceId, ip: clientIp })
+					return c.json(
+						{
+							error: 'invalid_grant',
+							error_description: 'too many accounts created from this device',
 						},
 						400
 					)

@@ -1035,6 +1035,47 @@ describe('auth worker routes', () => {
 		expect(other.status).toBe(200)
 	})
 
+	test('POST /connect/token caps the accounts created from one device', async () => {
+		// One install, many networks: the VPN-hopping signup the IP cap can't see. Each
+		// signup posts a fresh IP so only the device arm can be what refuses it.
+		const deviceId = 'dev-capped-install'
+		for (let i = 0; i < 3; i++) {
+			const ok = await postToken(
+				`grant_type=create_account&platform_id=steam-devcap${i}&device_id=${deviceId}&device_class=2`,
+				`198.51.100.${40 + i}`
+			)
+			expect(ok.status).toBe(200)
+		}
+		// The 4th signup from that device is refused — the cap is 3.
+		const capped = await postToken(
+			`grant_type=create_account&platform_id=steam-devcap3&device_id=${deviceId}&device_class=2`,
+			'198.51.100.43'
+		)
+		expect(capped.status).toBe(400)
+		expect(capped.json.error).toBe('invalid_grant')
+		expect(capped.json.error_description).toMatch(/device/)
+
+		// Another device is unaffected, and a signup that posts no device id (the website's)
+		// can't be attributed to one, so the arm skips it rather than lumping it in.
+		const other = await postToken(
+			'grant_type=create_account&platform_id=steam-devcap4&device_id=dev-other-install&device_class=2',
+			'198.51.100.44'
+		)
+		expect(other.status).toBe(200)
+		const deviceless = await postToken(
+			'grant_type=create_account&platform_id=steam-devcap5',
+			'198.51.100.45'
+		)
+		expect(deviceless.status).toBe(200)
+
+		// The capped device can still LOG IN to what it has — the cap is on signup only.
+		const login = await postToken(
+			`grant_type=password&username=Player42&password=${LOGIN_PASSWORD}&device_id=${deviceId}&device_class=2`,
+			'198.51.100.46'
+		)
+		expect(login.status).toBe(200)
+	})
+
 	test('the signup caps come from vars, and 0 disables an arm', async () => {
 		// The cap an operator actually runs is the `MAX_ACCOUNTS_PER_IP` var; the constant in
 		// auth.app.ts is only the fallback. `env` is shared by every test in this file, so the
@@ -1055,6 +1096,24 @@ describe('auth worker routes', () => {
 			expect(uncapped.status).toBe(200)
 		} finally {
 			env.MAX_ACCOUNTS_PER_IP = original
+		}
+
+		// The device arm reads its own var the same way.
+		const originalDevice = env.MAX_ACCOUNTS_PER_DEVICE_ID
+		try {
+			env.MAX_ACCOUNTS_PER_DEVICE_ID = 1
+			const device = '&device_id=dev-var-install&device_class=2'
+			const first = await postToken(`grant_type=create_account&platform_id=steam-dvar0${device}`)
+			expect(first.status).toBe(200)
+			const capped = await postToken(`grant_type=create_account&platform_id=steam-dvar1${device}`)
+			expect(capped.status).toBe(400)
+			expect(capped.json.error_description).toMatch(/device/)
+
+			env.MAX_ACCOUNTS_PER_DEVICE_ID = 0
+			const uncapped = await postToken(`grant_type=create_account&platform_id=steam-dvar2${device}`)
+			expect(uncapped.status).toBe(200)
+		} finally {
+			env.MAX_ACCOUNTS_PER_DEVICE_ID = originalDevice
 		}
 	})
 

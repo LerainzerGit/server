@@ -26,6 +26,7 @@ export type Env = SharedHonoEnv & {
 	// read them through `intVar`, never as a bare number.
 	MAX_ACCOUNTS_PER_PLATFORM_ID?: string | number
 	MAX_ACCOUNTS_PER_IP?: string | number
+	MAX_ACCOUNTS_PER_DEVICE_ID?: string | number
 	/**
 	 * Which linked arms a ban is enforced through, as a comma-separated list out of `ip`
 	 * and `platform` — or `off` for neither. Unset means BOTH: a ban reaches the accounts
