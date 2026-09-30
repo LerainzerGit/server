@@ -296,6 +296,44 @@ export async function deleteImage(db: D1Database, image: SavedImage): Promise<vo
 }
 
 /**
+ * Set an image's `Accessibility` (0 private, 1 public) in place on the stored record.
+ * Authorization — the caller must be the image's `PlayerId`, and a locked image
+ * (`AccessibilityLocked`, set by moderation) refuses — is the route's job
+ * (see modifyaccessibility).
+ */
+export async function setImageAccessibility(
+	db: D1Database,
+	image: SavedImage,
+	accessibility: number
+): Promise<void> {
+	await db
+		.prepare(
+			"UPDATE image SET data = json_set(data, '$.Accessibility', CAST(?2 AS INTEGER)) WHERE id = ?1"
+		)
+		.bind(image.Id, accessibility)
+		.run()
+}
+
+/**
+ * Set an image's `Description` in place on the stored record; `null` clears it.
+ * Authorization (the caller must be the image's `PlayerId`) is the route's job
+ * (see modifydescription).
+ */
+export async function setImageDescription(
+	db: D1Database,
+	image: SavedImage,
+	description: string | null
+): Promise<void> {
+	// json_set with a bound NULL stores SQL NULL, not JSON null, so spell the null out.
+	const sql =
+		description === null
+			? "UPDATE image SET data = json_set(data, '$.Description', json('null')) WHERE id = ?1"
+			: "UPDATE image SET data = json_set(data, '$.Description', ?2) WHERE id = ?1"
+	const stmt = db.prepare(sql)
+	await (description === null ? stmt.bind(image.Id) : stmt.bind(image.Id, description)).run()
+}
+
+/**
  * The public images taken in a room, for the room's photo feed. Only publicly
  * accessible images (Accessibility === 1) are returned. `filter` narrows by
  * `SavedImageType` (0 = all types); `sort` orders the feed — `1` puts the most

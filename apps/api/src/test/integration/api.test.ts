@@ -6955,7 +6955,7 @@ describe('images', () => {
 		expect(JSON.parse(row!.data).profileImage).toBe(ImageName)
 	})
 
-	test('DELETE /api/images/v1/deletesaved removes the owner’s image (row + cheers + R2)', async () => {
+	test('POST /api/images/v1/deletesaved removes the owner’s image (row + cheers + R2)', async () => {
 		const ImageName = 'sharecamera/2026-07-17/delete-me.jpg'
 		await env.IMAGES.put(ImageName, new Uint8Array([1, 2, 3]))
 		await env.DB.prepare('INSERT INTO image (data) VALUES (?1)')
@@ -6983,7 +6983,7 @@ describe('images', () => {
 
 		const del = (headers: Record<string, string>) =>
 			exports.default.fetch(`${ORIGIN}/api/images/v1/deletesaved`, {
-				method: 'DELETE',
+				method: 'POST',
 				headers: { 'Content-Type': 'application/json', ...headers },
 				body: JSON.stringify({ ImageName }),
 			})
@@ -6995,7 +6995,7 @@ describe('images', () => {
 
 		// Unknown image → 404.
 		const unknown = await exports.default.fetch(`${ORIGIN}/api/images/v1/deletesaved`, {
-			method: 'DELETE',
+			method: 'POST',
 			headers: { 'Content-Type': 'application/json', ...(await bearer('42')) },
 			body: JSON.stringify({ ImageName: 'sharecamera/nope.jpg' }),
 		})
@@ -7009,6 +7009,113 @@ describe('images', () => {
 			'SELECT COUNT(*) AS n FROM image_interaction WHERE saved_image_id = 8100'
 		).first<{ n: number }>()
 		expect(cheers!.n).toBe(0)
+	})
+
+	/** Seed one image row owned by the default bearer account (42). */
+	const seedOwnedImage = async (
+		Id: number,
+		ImageName: string,
+		extra: Record<string, unknown> = {}
+	) =>
+		env.DB.prepare('INSERT INTO image (data) VALUES (?1)')
+			.bind(
+				JSON.stringify({
+					Id,
+					Type: 1,
+					Accessibility: 1,
+					AccessibilityLocked: false,
+					ImageName,
+					Description: null,
+					PlayerId: 42,
+					TaggedPlayerIds: [],
+					RoomId: null,
+					PlayerEventId: null,
+					CreatedAt: new Date().toISOString(),
+					CheerCount: 0,
+					CommentCount: 0,
+					...extra,
+				})
+			)
+			.run()
+
+	const postImageJson = (path: string, headers: Record<string, string>, body: unknown) =>
+		exports.default.fetch(`${ORIGIN}${path}`, {
+			method: 'POST',
+			headers: { 'Content-Type': 'application/json', ...headers },
+			body: JSON.stringify(body),
+		})
+
+	test('POST /api/images/v2/modifyaccessibility flips the owner’s image and gates on the owner', async () => {
+		const ImageName = 'sharecamera/2026-09-13/flip-me.jpg'
+		await seedOwnedImage(8101, ImageName)
+		const path = '/api/images/v2/modifyaccessibility'
+
+		// No token → 401; a different account → 403; the image is untouched.
+		expect((await postImageJson(path, {}, { ImageName, Accessibility: 0 })).status).toBe(401)
+		expect(
+			(await postImageJson(path, await bearer('43'), { ImageName, Accessibility: 0 })).status
+		).toBe(403)
+		expect((await getImageByName(env.DB, ImageName))!.Accessibility).toBe(1)
+
+		// Unknown image → 404; a bad accessibility or no name → 400.
+		const owner = await bearer('42')
+		expect(
+			(await postImageJson(path, owner, { ImageName: 'sharecamera/nope.jpg', Accessibility: 0 }))
+				.status
+		).toBe(404)
+		expect((await postImageJson(path, owner, { ImageName, Accessibility: 7 })).status).toBe(400)
+		expect((await postImageJson(path, owner, { Accessibility: 0 })).status).toBe(400)
+
+		// Owner → 200 and the record is now private; back to 1 makes it public again.
+		const res = await postImageJson(path, owner, { ImageName, Accessibility: 0 })
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ success: true })
+		expect((await getImageByName(env.DB, ImageName))!.Accessibility).toBe(0)
+		expect((await postImageJson(path, owner, { ImageName, Accessibility: 1 })).status).toBe(200)
+		expect((await getImageByName(env.DB, ImageName))!.Accessibility).toBe(1)
+
+		// A locked image refuses even its owner.
+		const locked = 'sharecamera/2026-09-13/locked.jpg'
+		await seedOwnedImage(8102, locked, { AccessibilityLocked: true, Accessibility: 0 })
+		expect((await postImageJson(path, owner, { ImageName: locked, Accessibility: 1 })).status).toBe(
+			403
+		)
+		expect((await getImageByName(env.DB, locked))!.Accessibility).toBe(0)
+	})
+
+	test('POST /api/images/v1/modifydescription sets the owner’s caption and gates on the owner', async () => {
+		const ImageName = 'sharecamera/2026-09-13/caption-me.jpg'
+		await seedOwnedImage(8103, ImageName)
+		const path = '/api/images/v1/modifydescription'
+
+		// No token → 401; a different account → 403; the caption is untouched.
+		expect((await postImageJson(path, {}, { ImageName, Description: 'x' })).status).toBe(401)
+		expect(
+			(await postImageJson(path, await bearer('43'), { ImageName, Description: 'x' })).status
+		).toBe(403)
+		expect((await getImageByName(env.DB, ImageName))!.Description).toBeNull()
+
+		// Unknown image → 404; a non-string description or no name → 400.
+		const owner = await bearer('42')
+		expect(
+			(await postImageJson(path, owner, { ImageName: 'sharecamera/nope.jpg', Description: 'x' }))
+				.status
+		).toBe(404)
+		expect((await postImageJson(path, owner, { ImageName, Description: 5 })).status).toBe(400)
+		expect((await postImageJson(path, owner, { Description: 'x' })).status).toBe(400)
+
+		// Owner → 200 and the caption is stored; the rest of the record is untouched.
+		const res = await postImageJson(path, owner, { ImageName, Description: 'tet' })
+		expect(res.status).toBe(200)
+		expect(await res.json()).toEqual({ success: true })
+		const after = await getImageByName(env.DB, ImageName)
+		expect(after!.Description).toBe('tet')
+		expect(after!.Accessibility).toBe(1)
+		expect(after!.PlayerId).toBe(42)
+
+		// An empty description clears the caption back to null.
+		expect((await postImageJson(path, owner, { ImageName, Description: '' })).status).toBe(200)
+		expect((await getImageByName(env.DB, ImageName))!.Description).toBeNull()
 	})
 
 	test('POST /api/images/v4/uploadsaved 401s without a bearer token', async () => {
@@ -9550,7 +9657,6 @@ describe('openapi', () => {
 		)
 		expect([...documented].sort()).toEqual([
 			'DELETE /api/customAvatarItems/v1/{id}',
-			'DELETE /api/images/v1/deletesaved',
 			'DELETE /api/playerevents/v2/delete/{eventId}',
 			'GET /api/CircuitChipLists/{list}',
 			'GET /api/PlayerReporting/v1/moderationBlockDetails',
@@ -9663,6 +9769,9 @@ describe('openapi', () => {
 			'POST /api/customAvatarItems/v1/{id}/report',
 			'POST /api/gamesight/event',
 			'POST /api/images/v1/cheer',
+			'POST /api/images/v1/deletesaved',
+			'POST /api/images/v1/modifydescription',
+			'POST /api/images/v2/modifyaccessibility',
 			'POST /api/images/v4/uploadsaved',
 			'POST /api/images/v5/cheered/bulk',
 			'POST /api/inventions/v1/cheer',

@@ -1658,8 +1658,20 @@ export const UploadImageResponse = z.object({
 	ImageName: z.string().describe('The bucket key; the img worker serves the object by it'),
 })
 
-/** `DELETE /api/images/v1/deletesaved` JSON body. */
+/** `POST /api/images/v1/deletesaved` JSON body. */
 export const DeleteImageRequest = z.object({ ImageName: z.string() })
+
+/** `POST /api/images/v2/modifyaccessibility` JSON body. */
+export const ModifyImageAccessibilityRequest = z.object({
+	ImageName: z.string(),
+	Accessibility: z.int().describe('0 private, 1 public'),
+})
+
+/** `POST /api/images/v1/modifydescription` JSON body. */
+export const ModifyImageDescriptionRequest = z.object({
+	ImageName: z.string(),
+	Description: z.string().nullable().describe('The new caption; null or empty clears it'),
+})
 
 /**
  * `POST /api/images/v5/cheered/bulk` form body — the saved-image ids to report cheer state
