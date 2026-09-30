@@ -38,6 +38,8 @@ import {
 	MatchmakingErrorCode,
 	MessageType,
 	MOST_ACTIVE_CLUBHOUSE_LIMIT,
+	putPlayerSettingsIfChanged,
+	readPlayerSettings,
 	recordRoomVisit,
 	recordStat,
 	refreshInstanceFullness,
@@ -420,10 +422,7 @@ async function getPlayerSettings(
 	env: Env,
 	accountId: number
 ): Promise<Record<string, string> | null> {
-	return env.RECFLARE_PLAYER_SETTINGS.get<Record<string, string>>(
-		`player:${accountId}`,
-		'json'
-	).catch(() => null)
+	return readPlayerSettings(env.RECFLARE_PLAYER_SETTINGS, accountId).catch(() => null)
 }
 
 /**
@@ -444,15 +443,16 @@ async function readAvoidJuniors(env: Env, accountId: number): Promise<boolean> {
  *
  * The write MERGES, exactly as the `playersettings` worker's own PUT does: the map holds
  * every setting the player has (OOBE state, tutorial mask, …), so storing this one on its
- * own would wipe the rest. Read-modify-write on KV isn't atomic, but the same is true of
- * the settings worker, and two writers racing over one player's own settings means that
- * player toggling two options in the same instant.
+ * own would wipe the rest. The key is whichever spelling the map already carries, which is
+ * why this doesn't go through `mergePlayerSettings` — but like it, re-posting the stored
+ * value writes nothing. A KV read failure throws (a 500) rather than reading as an empty
+ * map, which would store this one key over everything the player had.
  */
 async function writeAvoidJuniors(env: Env, accountId: number, value: boolean): Promise<void> {
-	const stored = (await getPlayerSettings(env, accountId)) ?? {}
+	const stored = await readPlayerSettings(env.RECFLARE_PLAYER_SETTINGS, accountId)
 	const merged: Record<string, string> = { ...stored }
 	merged[findAvoidJuniorsKey(merged) ?? AVOID_JUNIORS_KEY] = value ? 'True' : 'False'
-	await env.RECFLARE_PLAYER_SETTINGS.put(`player:${accountId}`, JSON.stringify(merged))
+	await putPlayerSettingsIfChanged(env.RECFLARE_PLAYER_SETTINGS, accountId, stored, merged)
 }
 
 /**

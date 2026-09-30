@@ -642,6 +642,21 @@ describe('public endpoints', () => {
 			expect(await stored(3202)).toEqual({ AVOID_JUNIORS: 'False' })
 		})
 
+		// Re-posting the stored value writes nothing to KV — writes are the cost, and the
+		// client posts this freely. The raw value is seeded with whitespace JSON.stringify
+		// never produces; surviving the PUT untouched means no write happened. Holds across
+		// the loose key match too: `AVOID_JUNIORS: 'True'` already says what `avoidJuniors=True`
+		// asks for.
+		test('does not write KV when the value is already stored', async () => {
+			const padded = '{ "Recroom.OOBE": "77", "AVOID_JUNIORS": "True" }'
+			await env.RECFLARE_PLAYER_SETTINGS.put('player:3205', padded)
+			expect(await write(3205, 'avoidJuniors=True')).toBe(true)
+			expect(await env.RECFLARE_PLAYER_SETTINGS.get('player:3205', 'text')).toBe(padded)
+
+			expect(await write(3205, 'avoidJuniors=False')).toBe(false)
+			expect(await stored(3205)).toEqual({ 'Recroom.OOBE': '77', AVOID_JUNIORS: 'False' })
+		})
+
 		test('accepts a JSON body', async () => {
 			const res = await exports.default.fetch(`${ORIGIN}/player/avoidjuniors`, {
 				method: 'PUT',

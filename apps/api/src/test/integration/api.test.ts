@@ -6742,6 +6742,13 @@ describe('images', () => {
 		// The setting is per-player.
 		expect(await (await read('710')).text()).toBe('2')
 
+		// Re-posting the stored value writes nothing to KV: the raw value is seeded with
+		// whitespace JSON.stringify never produces, and it survives the PUT untouched.
+		const padded = '{ "Recroom.OOBE": "77", "playerPhotoTaggingSetting": "1" }'
+		await env.RECFLARE_PLAYER_SETTINGS.put('player:712', padded)
+		expect(await (await write('712', { Setting: 1 })).text()).toBe('1')
+		expect(await env.RECFLARE_PLAYER_SETTINGS.get('player:712', 'text')).toBe(padded)
+
 		// A body with no readable Setting leaves the stored value alone rather than writing 0
 		// — and answers what the player still has.
 		expect(await (await write('710', { Nothing: true })).text()).toBe('2')
