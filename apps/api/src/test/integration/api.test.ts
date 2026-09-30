@@ -6550,6 +6550,37 @@ describe('images', () => {
 		})
 	})
 
+	// The feed is anonymous, so a private photo (Accessibility 0) must never reach it —
+	// there is no viewer it could be unlocked for. It once accepted 0 alongside 1.
+	test('GET /api/images/v1/slideshow leaves private photos out', async () => {
+		const pub = await createImage(env.DB, {
+			imageName: 'slidepublic.jpg',
+			playerId: 42,
+			accessibility: 1,
+		})
+		const priv = await createImage(env.DB, {
+			imageName: 'slideprivate.jpg',
+			playerId: 42,
+			accessibility: 0,
+		})
+		// A non-photo (room thumbnail) that happens to be public stays out too.
+		const thumb = await createImage(env.DB, {
+			imageName: 'slidethumb.jpg',
+			playerId: 42,
+			type: 3,
+			accessibility: 1,
+		})
+
+		const res = await exports.default.fetch(`${ORIGIN}/api/images/v1/slideshow?take=100`)
+		expect(res.status).toBe(200)
+		const ids = ((await res.json()) as { Images: Array<{ SavedImageId: number }> }).Images.map(
+			(i) => i.SavedImageId
+		)
+		expect(ids).toContain(pub.Id)
+		expect(ids).not.toContain(priv.Id)
+		expect(ids).not.toContain(thumb.Id)
+	})
+
 	// The feed is public and unauthenticated, so `take` is clamped rather than trusted:
 	// without the cap a single anonymous request could pull the whole image table through
 	// the two joins behind it.

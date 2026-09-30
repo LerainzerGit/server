@@ -518,9 +518,11 @@ async function getRoomNames(db: D1Database, ids: number[]): Promise<Map<number, 
 }
 
 /**
- * The global slideshow feed — the most recent publicly-listable ShareCamera photos
- * across all rooms (Accessibility 0 or 1, Type 1), newest first, capped at `limit`.
- * Only ShareCamera images are surfaced (not room/profile/invention thumbnails). Each
+ * The global slideshow feed — the most recent PUBLIC ShareCamera photos across all rooms
+ * (Accessibility 1, Type 1), newest first, capped at `limit`. Accessibility 0 is a
+ * private photo — the same bar every other public image read here applies — and the
+ * feed is anonymous, so it must never surface one. Only ShareCamera images are surfaced
+ * (not room/profile/invention thumbnails). Each
  * row is joined to its creator's username and (if any) its room's name. Returns the
  * projected SlideshowImage shape. Usernames/room names are resolved in two batched
  * lookups to avoid an N+1 across the (at most `limit`) images.
@@ -532,7 +534,7 @@ export async function getSlideshowImages(
 	const { results } = await db
 		.prepare(
 			`SELECT data FROM image
-			 WHERE json_extract(data, '$.Accessibility') IN (0, 1)
+			 WHERE json_extract(data, '$.Accessibility') = 1
 			   AND json_extract(data, '$.Type') = ?1
 			 ORDER BY id DESC LIMIT ?2`
 		)

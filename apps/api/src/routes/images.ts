@@ -468,10 +468,11 @@ export const imageRoutes = new Hono<App>({ strict: false })
 		}
 	)
 
-	// Global slideshow feed — the most recent publicly-listable ShareCamera photos
-	// (Accessibility 0 or 1, Type 1) across all rooms, newest first, each joined to its
-	// creator's username and room name. Public (no auth): it only surfaces already-public
-	// images and backs the anonymous homepage slideshow. Returns `{ Images, ValidTill }`,
+	// Global slideshow feed — the most recent public ShareCamera photos (Accessibility 1,
+	// Type 1) across all rooms, newest first, each joined to its creator's username and
+	// room name. Public (no auth): it only surfaces already-public images and backs the
+	// anonymous homepage slideshow. Private photos (Accessibility 0) never appear — the
+	// feed is anonymous, so there is no viewer it could be unlocked for. Returns `{ Images, ValidTill }`,
 	// where ValidTill is a short (2-minute) cache hint the client refreshes against.
 	// Serves 10 by default and never more than SLIDESHOW_MAX_LIMIT (100): it's public and
 	// unauthenticated, so an unclamped `take` would let anyone ask for the whole image
