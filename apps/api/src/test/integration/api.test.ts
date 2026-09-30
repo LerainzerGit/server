@@ -6245,17 +6245,16 @@ describe('player reports', () => {
 			expect(res.status).toBe(401)
 		})
 
-		// Duration and TimeoutStartedAt are a pair in the client — the block runs from the
-		// start for the duration. The start is `banned_at`, the instant the ban was handed
-		// down (see 0020_report_ban_audit.sql), NOT the report's created_at: the two can be
-		// months apart. A permanent ban runs for the largest span the int holds.
+		// `Duration` is the seconds LEFT — the client counts it down from receipt. A permanent
+		// ban runs for the largest span the int holds, and `TimeoutStartedAt` stays null: the
+		// client does not pair it with `Duration` for a ban.
 		test('describes a permanent ban', async () => {
 			await submit(
 				{ PlayerIdReported: '221', ReportCategory: '102', Details: 'slurs' },
 				await bearer()
 			)
 			const [row] = await getReportsAgainst(env.DB, 221)
-			const banned = await banFromReport(env.DB, row!.id)
+			await banFromReport(env.DB, row!.id)
 
 			expect(await details('POST', '221')).toEqual({
 				...NOT_BLOCKED,
@@ -6266,21 +6265,15 @@ describe('player reports', () => {
 				// the reporter is not shown to the player they reported (PlayerIdReporter
 				// stays null).
 				Message: 'Rule violation',
-				TimeoutStartedAt: banned!.banned_at,
 			})
 		})
 
-		// A timed ban's Duration is the seconds from the start to the expiry, so the pair
-		// sums to `ban_expires` — not the seconds left as of the request.
-		test('describes a timed ban as its banned_at plus the span to expiry', async () => {
+		// A fresh timed ban: the seconds left are (within the write's latency) the whole ban.
+		test('describes a timed ban as the seconds left as of the request', async () => {
 			await submit({ PlayerIdReported: '222', ReportCategory: '103' }, await bearer())
 			const [row] = await getReportsAgainst(env.DB, 222)
-			// The expiry is set relative to NOW, which is what a moderator handing down a
-			// one-hour ban means — and now is `banned_at`, not the report's created_at.
 			const banExpires = new Date(Date.now() + 3600 * 1000)
-			const banned = await banFromReport(env.DB, row!.id, {
-				banExpires: banExpires.toISOString(),
-			})
+			await banFromReport(env.DB, row!.id, { banExpires: banExpires.toISOString() })
 
 			// `Duration` is asserted as a range below, so it is left out of the object match
 			// — NOT_BLOCKED carries a 0 for it, which would win over the real value.
@@ -6291,59 +6284,59 @@ describe('player reports', () => {
 				ReportCategory: 103,
 				IsBan: true,
 				Message: 'Rule violation',
-				TimeoutStartedAt: banned!.banned_at,
+				TimeoutStartedAt: null,
 			})
-			// Within a second of the hour: `banned_at` is stamped by the write, so the span
-			// is the hour minus however long the write took.
+			// Within a second of the hour: however long the write took has already elapsed.
 			expect(body.Duration).toBeGreaterThan(3595)
 			expect(body.Duration).toBeLessThanOrEqual(3600)
 		})
 
-		// The whole point of `banned_at`: a ban applied to an OLD report used to be
-		// described as having started when the report was filed, so a 7-day ban on a
-		// month-old report told the player their block began a month ago — and the duration,
-		// measured from there, came out as already served. Both halves of the pair now
-		// start from the ban.
-		test('counts a ban from when it was handed down, not from when the report was filed', async () => {
+		// The case the bug lived in: a player signing in AFTER the ban was handed down. The
+		// client counts `Duration` down from the moment it receives it, so it must be what is
+		// left NOW — not the ban's full span from `banned_at`, which read as the whole ban
+		// still to run at every sign-in (and only looked right in the mid-session kick frame,
+		// sent at the instant the span and the remainder are the same).
+		test('counts down: a ban handed down a day ago has a day less to run', async () => {
 			await submit({ PlayerIdReported: '224', ReportCategory: '102' }, await bearer())
 			const [row] = await getReportsAgainst(env.DB, 224)
-			// Backdate the report a month, as if it had sat in the queue.
-			const filed = new Date(Date.now() - 30 * 86_400_000).toISOString()
-			await env.DB.prepare('UPDATE report SET created_at = ?2 WHERE id = ?1')
-				.bind(row!.id, filed)
+			// A seven-day ban handed down yesterday: six days left.
+			const banned = await banFromReport(env.DB, row!.id, {
+				banExpires: new Date(Date.now() + 6 * 86_400_000).toISOString(),
+			})
+			await env.DB.prepare('UPDATE report SET banned_at = ?2 WHERE id = ?1')
+				.bind(row!.id, new Date(Date.now() - 86_400_000).toISOString())
 				.run()
 
-			const banned = await banFromReport(env.DB, row!.id, {
-				banExpires: new Date(Date.now() + 7 * 86_400_000).toISOString(),
-			})
 			const body = (await details('GET', '224')) as Record<string, unknown>
-			expect(body.TimeoutStartedAt).toBe(banned!.banned_at)
-			expect(body.TimeoutStartedAt).not.toBe(filed)
-			// Seven days, not the negative-then-clamped span the report's date would give.
-			expect(body.Duration).toBeGreaterThan(7 * 86_400 - 5)
-			expect(body.Duration).toBeLessThanOrEqual(7 * 86_400)
+			expect(body.IsBan).toBe(true)
+			expect(body.Duration).toBeGreaterThan(6 * 86_400 - 5)
+			expect(body.Duration).toBeLessThanOrEqual(6 * 86_400)
+			// The start is not on the wire at all: null, not `banned_at`.
+			expect(body.TimeoutStartedAt).toBeNull()
+			expect(banned!.banned_at).not.toBeNull()
 		})
 
-		// A row banned BEFORE 0020 added the column carries no `banned_at`, and must keep
-		// reading exactly as it used to rather than falling back to "now" — which would
-		// silently restart every standing ban the moment this shipped.
-		test('falls back to created_at for a ban with no recorded banned_at', async () => {
+		// A row banned BEFORE 0020 added `banned_at` reads the same as any other: the
+		// remainder needs only `ban_expires`.
+		test('reads a ban with no recorded banned_at the same way', async () => {
 			await submit({ PlayerIdReported: '225', ReportCategory: '101' }, await bearer())
 			const [row] = await getReportsAgainst(env.DB, 225)
 			await env.DB.prepare(
 				`UPDATE report SET banned = 1, ban_expires = ?2, banned_at = NULL WHERE id = ?1`
 			)
-				.bind(row!.id, new Date(Date.parse(row!.created_at) + 3600 * 1000).toISOString())
+				.bind(row!.id, new Date(Date.now() + 3600 * 1000).toISOString())
 				.run()
 
-			expect(await details('GET', '225')).toEqual({
-				...NOT_BLOCKED,
+			const { Duration: _duration, ...unblocked } = NOT_BLOCKED
+			const body = (await details('GET', '225')) as Record<string, unknown>
+			expect(body).toMatchObject({
+				...unblocked,
 				ReportCategory: 101,
-				Duration: 3600,
 				IsBan: true,
 				Message: 'Rule violation',
-				TimeoutStartedAt: row!.created_at,
 			})
+			expect(body.Duration).toBeGreaterThan(3595)
+			expect(body.Duration).toBeLessThanOrEqual(3600)
 		})
 
 		// A ban that has served its time is not a block, even though the row still says
