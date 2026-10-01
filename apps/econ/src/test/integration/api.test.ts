@@ -2241,6 +2241,180 @@ describe('econ endpoints', () => {
 			expect((await keysOf(2511)).length).toBe(10)
 			await env.DB.prepare('DELETE FROM room_key').run()
 		})
+
+		test('POST create refuses a token price over 1000', async () => {
+			const atCap = await create({ ...body, Price: '1000' }, await bearer('1'))
+			expect((await envOf(atCap)).Status).toBe(0)
+			const over = await create({ ...body, Price: '1001' }, await bearer('1'))
+			expect(await envOf(over)).toEqual({ Status: 1, RoomKey: null })
+			await env.DB.prepare('DELETE FROM room_key').run()
+		})
+
+		test('PUT updateAll edits one key, capping the price by its currency', async () => {
+			const update = async (fields: Record<string, string>, headers?: Record<string, string>) =>
+				exports.default.fetch(`${ORIGIN}/api/roomkeys/v1/updateAll`, {
+					method: 'PUT',
+					headers: { 'Content-Type': 'application/x-www-form-urlencoded', ...headers },
+					body: new URLSearchParams(fields),
+				})
+			const mint = async (roomId: string, as: string) =>
+				(
+					(await (
+						await exports.default.fetch(`${ORIGIN}/api/roomcurrencies/v1/createCurrency`, {
+							method: 'POST',
+							headers: {
+								'Content-Type': 'application/x-www-form-urlencoded',
+								...(await bearer(as)),
+							},
+							body: new URLSearchParams({ RoomId: roomId, Name: 'coin' }),
+						})
+					).json()) as { Value: { CurrencyId: string } }
+				).Value.CurrencyId
+
+			const key = await keyOf(await create(body, await bearer('1')))
+			const other = await keyOf(await create({ ...body, Name: 'other' }, await bearer('1')))
+			const id = String(key.RoomKeyId)
+			// The body exactly as the client puts it.
+			const edit = {
+				RoomKeyId: id,
+				Name: 'key1',
+				Description: 'testssdfsdfsdf',
+				Price: '1000',
+				PurchaseCurrencyId: '',
+			}
+			const refused = { Status: 1, RoomKey: null }
+
+			expect((await update(edit)).status).toBe(401)
+			expect((await update(edit, await bearer('42'))).status).toBe(403)
+
+			// In tokens: 1000 passes, 1001 does not. A co-owner may edit.
+			const res = await update(edit, await bearer('2'))
+			expect(res.status).toBe(200)
+			expect(await envOf(res)).toEqual({
+				Status: 0,
+				RoomKey: { ...key, Name: 'key1', Description: 'testssdfsdfsdf', Price: 1000 },
+			})
+			expect(await envOf(await update({ ...edit, Price: '1001' }, await bearer('1')))).toEqual(
+				refused
+			)
+
+			// In the room's own currency the cap is a billion.
+			const currencyId = await mint('2511', '1')
+			const rich = { ...edit, Price: '1000000000', PurchaseCurrencyId: currencyId }
+			expect((await envOf(await update(rich, await bearer('1')))).RoomKey).toMatchObject({
+				Price: 1000000000,
+				PurchaseCurrencyId: currencyId,
+			})
+			expect(
+				await envOf(await update({ ...rich, Price: '1000000001' }, await bearer('1')))
+			).toEqual(refused)
+			// Back to tokens with the big price still on it: the token cap applies again.
+			expect(
+				await envOf(await update({ RoomKeyId: id, PurchaseCurrencyId: '' }, await bearer('1')))
+			).toEqual(refused)
+
+			// Refusals: no such key, a blank name, an unknown currency.
+			for (const bad of [
+				{ ...edit, RoomKeyId: '999999' },
+				{ ...edit, Name: '  ' },
+				{ ...edit, PurchaseCurrencyId: '46eddc63-e6d4-42cc-bf04-5d879e33ac17' },
+			]) {
+				expect(await envOf(await update(bad, await bearer('1')))).toEqual(refused)
+			}
+
+			// Only the named key moved, and the refused edits left it as the last good one.
+			expect(await keysOf(2511)).toEqual([
+				{
+					...key,
+					Name: 'key1',
+					Description: 'testssdfsdfsdf',
+					Price: 1000000000,
+					PurchaseCurrencyId: currencyId,
+				},
+				other,
+			])
+
+			await env.DB.prepare('DELETE FROM room_key').run()
+			await env.DB.prepare('DELETE FROM room_currency WHERE currency_id = ?1')
+				.bind(currencyId)
+				.run()
+		})
+
+		test('PUT updateAll: a BLANK PurchaseCurrencyId or ImageName clears it; an absent one is left alone', async () => {
+			const update = async (fields: Record<string, string>) =>
+				envOf(
+					await exports.default.fetch(`${ORIGIN}/api/roomkeys/v1/updateAll`, {
+						method: 'PUT',
+						headers: {
+							'Content-Type': 'application/x-www-form-urlencoded',
+							...(await bearer('1')),
+						},
+						body: new URLSearchParams(fields),
+					})
+				)
+			const stored = async (roomKeyId: number) =>
+				env.DB.prepare(
+					'SELECT purchase_currency_id, image_name FROM room_key WHERE room_key_id = ?1'
+				)
+					.bind(roomKeyId)
+					.first<{ purchase_currency_id: string | null; image_name: string }>()
+
+			const currencyId = (
+				(await (
+					await exports.default.fetch(`${ORIGIN}/api/roomcurrencies/v1/createCurrency`, {
+						method: 'POST',
+						headers: {
+							'Content-Type': 'application/x-www-form-urlencoded',
+							...(await bearer('1')),
+						},
+						body: new URLSearchParams({ RoomId: '2511', Name: 'coin' }),
+					})
+				).json()) as { Value: { CurrencyId: string } }
+			).Value.CurrencyId
+
+			const key = await keyOf(await create(body, await bearer('1')))
+			const id = String(key.RoomKeyId)
+			expect(key).toMatchObject({ PurchaseCurrencyId: null, ImageName: null })
+
+			// Put the key on the room's currency and give it art.
+			const set = await update({
+				RoomKeyId: id,
+				PurchaseCurrencyId: currencyId,
+				ImageName: 'key.png',
+			})
+			expect(set.RoomKey).toMatchObject({ PurchaseCurrencyId: currencyId, ImageName: 'key.png' })
+			expect(await stored(key.RoomKeyId)).toEqual({
+				purchase_currency_id: currencyId,
+				image_name: 'key.png',
+			})
+
+			// An edit that mentions neither leaves both alone.
+			const renamed = await update({ RoomKeyId: id, Name: 'renamed' })
+			expect(renamed.RoomKey).toMatchObject({
+				Name: 'renamed',
+				PurchaseCurrencyId: currencyId,
+				ImageName: 'key.png',
+			})
+
+			// Blank clears the currency — NULL in the row, null on the wire — and nothing else.
+			const noCurrency = await update({ RoomKeyId: id, PurchaseCurrencyId: '' })
+			expect(noCurrency.RoomKey).toMatchObject({ PurchaseCurrencyId: null, ImageName: 'key.png' })
+			expect(await stored(key.RoomKeyId)).toEqual({
+				purchase_currency_id: null,
+				image_name: 'key.png',
+			})
+
+			// Blank clears the art: '' in the row, served as null. The list read agrees.
+			const noArt = await update({ RoomKeyId: id, ImageName: '' })
+			expect(noArt.RoomKey).toMatchObject({ PurchaseCurrencyId: null, ImageName: null })
+			expect(await stored(key.RoomKeyId)).toEqual({ purchase_currency_id: null, image_name: '' })
+			expect(await keysOf(2511)).toEqual([noArt.RoomKey])
+
+			await env.DB.prepare('DELETE FROM room_key').run()
+			await env.DB.prepare('DELETE FROM room_currency WHERE currency_id = ?1')
+				.bind(currencyId)
+				.run()
+		})
 	})
 
 	test('GET /api/roomconsumables/v1/roomConsumable/room/:id/me returns []', async () => {
@@ -6073,6 +6247,7 @@ describe('econ endpoints', () => {
 			'POST /api/ugcPurchasables/v1/items/bulk',
 			'PUT /api/equipment/v1/update',
 			'PUT /api/roomconsumables/v1/roomConsumable',
+			'PUT /api/roomkeys/v1/updateAll',
 		])
 
 		// Every operation carries a summary — a path present but undescribed is not

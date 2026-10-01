@@ -7,6 +7,7 @@
  * a player by being awarded. The endpoints:
  *  - `POST /api/roomkeys/v1/create` lists one
  *  - `GET  /api/roomkeys/v1/room?roomId=` lists a room's
+ *  - `PUT  /api/roomkeys/v1/updateAll` edits one
  *  - `POST /api/roomkeys/v1/awardbulk` awards the caller some
  *  - `POST /api/roomkeys/v1/owns/bulk` says who holds which
  *
@@ -24,8 +25,8 @@ export const ROOM_KEY_SCHEMA_DDL: string[] = [
 	// back as the ORDINAL (`Type: 0`) — see {@link ROOM_KEY_TYPE_ORDINALS}. Only `Key` has
 	// been observed.
 	//
-	// `purchase_currency_id` is the `room_currency` the key is charged in — nullable, and the
-	// create body names none. `image_name` is '' in the row (NOT NULL), but the client reads
+	// `purchase_currency_id` is the `room_currency` the key is charged in — null means tokens,
+	// which is what a new key costs: the create body names none, and an edit can set it. `image_name` is '' in the row (NOT NULL), but the client reads
 	// `ImageName` as null until a key carries art, so an empty column is served as null.
 	`CREATE TABLE IF NOT EXISTS room_key (
 		room_key_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -76,11 +77,11 @@ export interface RoomKey {
 	Name: string
 	Description: string
 	Price: number
-	/** A `room_currency` id, or null — the create body names none. */
+	/** A `room_currency` id, or null for tokens — which is what a new key is priced in. */
 	PurchaseCurrencyId: string | null
 	/** ISO-8601 UTC. */
 	CreatedAt: string
-	/** Null until a key can carry art. */
+	/** Null until an edit gives the key art. */
 	ImageName: string | null
 	/** The key type's ordinal — 0 `Key`. See {@link ROOM_KEY_TYPE_ORDINALS}. */
 	Type: number
@@ -145,6 +146,56 @@ export async function createRoomKey(db: D1Database, key: NewRoomKey): Promise<Ro
 		.first<RoomKeyRow>()
 
 	return toRoomKey(row!)
+}
+
+/** One key by its id, or null when there is no such row. */
+export async function getRoomKey(db: D1Database, roomKeyId: number): Promise<RoomKey | null> {
+	const row = await db
+		.prepare(`SELECT ${SELECT_COLUMNS} FROM room_key WHERE room_key_id = ?1`)
+		.bind(roomKeyId)
+		.first<RoomKeyRow>()
+
+	return row ? toRoomKey(row) : null
+}
+
+/** What an edit may change — the rest of a key (its ids, room, type, `CreatedAt`) is fixed. */
+export interface RoomKeyChanges {
+	Name: string
+	Description: string
+	Price: number
+	/** A `room_currency` id, or null for tokens. */
+	PurchaseCurrencyId: string | null
+	/** The key's art, or null for none — stored as '' (the column is NOT NULL). */
+	ImageName: string | null
+}
+
+/**
+ * Rewrite a key's editable fields, returning it as it now stands — null when `roomKeyId`
+ * names no listed key.
+ */
+export async function updateRoomKey(
+	db: D1Database,
+	roomKeyId: number,
+	changes: RoomKeyChanges
+): Promise<RoomKey | null> {
+	const row = await db
+		.prepare(
+			`UPDATE room_key
+			 SET name = ?2, description = ?3, price = ?4, purchase_currency_id = ?5, image_name = ?6
+			 WHERE room_key_id = ?1
+			 RETURNING ${SELECT_COLUMNS}`
+		)
+		.bind(
+			roomKeyId,
+			changes.Name,
+			changes.Description,
+			changes.Price,
+			changes.PurchaseCurrencyId,
+			changes.ImageName ?? ''
+		)
+		.first<RoomKeyRow>()
+
+	return row ? toRoomKey(row) : null
 }
 
 /**

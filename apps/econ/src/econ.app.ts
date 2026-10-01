@@ -144,6 +144,7 @@ import {
 	UpdateObjectiveRequest,
 	UpdateObjectiveResponse,
 	UpdateRoomCurrencyRequest,
+	UpdateRoomKeyRequest,
 	UpsertRoomConsumableRequest,
 } from './openapi'
 import { claimReward, isNewActivity } from './reward-db'
@@ -162,7 +163,14 @@ import {
 	getRoomCurrency,
 	updateRoomCurrency,
 } from './room-currency-db'
-import { awardRoomKey, createRoomKey, getRoomKeys, ownsRoomKeys } from './room-key-db'
+import {
+	awardRoomKey,
+	createRoomKey,
+	getRoomKey,
+	getRoomKeys,
+	ownsRoomKeys,
+	updateRoomKey,
+} from './room-key-db'
 
 import type { Context } from 'hono'
 import type { GiftContent, Outfit, Progression, StoredGift, XpGrant } from '@repo/domain'
@@ -294,6 +302,14 @@ const ROOM_KEY_STATUS_FAILED = 1
  * refuses what the client already knows not to ask for.
  */
 const MAX_KEYS_PER_ROOM = 10
+
+/**
+ * The most a room key may cost, by what it is priced in: tokens (a null `PurchaseCurrencyId`)
+ * are real money to the player paying, so they are capped low; a room's own currency is the
+ * room's to inflate.
+ */
+const MAX_KEY_PRICE_TOKENS = 1000
+const MAX_KEY_PRICE_ROOM_CURRENCY = 1_000_000_000
 
 /**
  * The envelope the create endpoint answers in: `{ Value, Success, Error, error_id }`.
@@ -5565,12 +5581,13 @@ const app = new Hono<App>({ strict: false })
 				'',
 				'`Name` and `Description` are masked by the same word list as every other string a',
 				'player types. A room may list at most 10 keys — the `RoomKeyConfig.MaxKeysPerRoom`',
-				'the `api` config tells the client — and the eleventh is refused.',
+				'the `api` config tells the client — and the eleventh is refused. A new key is priced',
+				'in tokens (the body names no currency), so a `Price` over 1000 is refused too.',
 				'',
 				'Answers `{ Status, RoomKey }` — `Status` 0 and the created key, as the live client',
 				'reads it — not the `{ Value, Success, Error, error_id }` envelope the room-currency',
 				'writes use. A recoverable refusal (an unusable `RoomId`, an empty `Name`, an unknown',
-				'room, a full room) is a 200 carrying a non-zero `Status` and a null `RoomKey`; only',
+				'room, a full room, a `Price` over the limit) is a 200 carrying a non-zero `Status` and a null `RoomKey`; only',
 				'the auth gates answer with an HTTP status of their own.',
 				'',
 				'Pushes `LocalRoomKeyCreated` (120), carrying the same object, to everyone in the',
@@ -5599,6 +5616,10 @@ const app = new Hono<App>({ strict: false })
 			if (!Number.isInteger(roomId)) return roomKeyEnvelope(c, null)
 			const name = str(body.Name).trim()
 			if (name === '') return roomKeyEnvelope(c, null)
+			// A key cannot cost less than nothing — nor, being priced in tokens until an edit
+			// says otherwise, more than the token cap.
+			const price = Math.max(0, int(body.Price, 0))
+			if (price > MAX_KEY_PRICE_TOKENS) return roomKeyEnvelope(c, null)
 
 			const canManage = await canManageRoomById(c.env.DB, roomId, accountId)
 			if (canManage === null) return roomKeyEnvelope(c, null)
@@ -5613,12 +5634,114 @@ const app = new Hono<App>({ strict: false })
 				Type: str(body.Type).trim() || 'Key',
 				Name: censorSwears(name),
 				Description: censorSwears(str(body.Description)),
-				// A key cannot cost less than nothing.
-				Price: Math.max(0, int(body.Price, 0)),
+				Price: price,
 			})
 
 			await pushRoomKeyCreated(c, key, accountId)
 			return roomKeyEnvelope(c, key)
+		}
+	)
+
+	// Edit a room key. "All" is the key's FIELDS, not the room's keys: the body names one
+	// `RoomKeyId` and carries everything editable about it. Gated like the create — the room
+	// comes off the KEY, never the request.
+	.put(
+		'/api/roomkeys/v1/updateAll',
+		describeRoute({
+			tags: ['Econ'],
+			summary: 'Update a room key',
+			description: [
+				'Edits ONE key — despite the name, "all" is its fields — form-encoded',
+				'(`RoomKeyId=43&Name=key1&Description=…&Price=1000&PurchaseCurrencyId=`).',
+				'',
+				'Gated to the CREATOR or a CO-OWNER of the room that lists the key; a valid token',
+				'from anyone else is a 403.',
+				'',
+				'`PurchaseCurrencyId` sent EMPTY prices the key in tokens (stored and served as',
+				'null) — that is how a key on a room currency is taken back off it; otherwise it',
+				'must be a `room_currency` id belonging to the key’s own room.',
+				'`ImageName` is the key’s art, stored as posted; sent EMPTY it clears the art',
+				'(served as null). That `ImageName` rides in this form is an ASSUMPTION.',
+				'`Price` is capped by what the key ends up priced in: 1000 in tokens, 1000000000 in',
+				'a room currency. A field left out of the body is left alone rather than reset, and',
+				'the cap is checked against the resulting pair.',
+				'',
+				'`Name` and `Description` are masked by the same word list as every other string a',
+				'player types. What can never change: the ids, the room, the `Type`, `CreatedAt`.',
+				'',
+				'Answers the create’s `{ Status, RoomKey }` envelope with the key as it now stands',
+				'— an ASSUMPTION: what the client reads from this response has not been observed.',
+				'A recoverable refusal (no such key, a blank `Name`, a `Price` over the cap, an',
+				'unknown or foreign currency) is a 200 carrying a non-zero `Status` and a null',
+				'`RoomKey`.',
+			].join('\n'),
+			security: AUTHED,
+			requestBody: form(UpdateRoomKeyRequest, 'The key and its fields'),
+			responses: {
+				200: json(RoomKeyEnvelope, 'The key as it now stands, or a refusal'),
+				401: UNAUTHORIZED_RESPONSE,
+				403: { description: 'Not the room’s creator or a co-owner (empty body)' },
+			},
+		}),
+		async (c) => {
+			const accountId = await authedId(c)
+			if (accountId === null) return unauthorized(c)
+
+			const body = (await c.req.parseBody().catch(() => ({}))) as Record<string, unknown>
+			const str = (v: unknown): string | undefined => (typeof v === 'string' ? v : undefined)
+
+			const roomKeyId = Number.parseInt(str(body.RoomKeyId) ?? '', 10)
+			if (!Number.isInteger(roomKeyId)) return roomKeyEnvelope(c, null)
+
+			const existing = await getRoomKey(c.env.DB, roomKeyId)
+			if (!existing) return roomKeyEnvelope(c, null)
+
+			const canManage = await canManageRoomById(c.env.DB, existing.RoomId, accountId)
+			if (canManage === null) return roomKeyEnvelope(c, null)
+			if (!canManage) return c.body(null, 403)
+
+			// A name sent but blank is a bad edit, not an instruction to leave it alone.
+			const name = str(body.Name)?.trim()
+			if (name === '') return roomKeyEnvelope(c, null)
+
+			let price = existing.Price
+			if (str(body.Price) !== undefined) {
+				price = Number.parseInt(str(body.Price)!, 10)
+				if (!Number.isInteger(price) || price < 0) return roomKeyEnvelope(c, null)
+			}
+
+			// Present-but-empty is a VALUE here — tokens — unlike the fields above, where only
+			// absence means "leave alone".
+			let purchaseCurrencyId = existing.PurchaseCurrencyId
+			const postedCurrencyId = str(body.PurchaseCurrencyId)?.trim()
+			if (postedCurrencyId === '') {
+				purchaseCurrencyId = null
+			} else if (postedCurrencyId !== undefined && postedCurrencyId !== purchaseCurrencyId) {
+				// A key is sold in its own room's money, not another's.
+				const currency = await getRoomCurrency(c.env.DB, postedCurrencyId)
+				if (!currency || currency.RoomId !== existing.RoomId) return roomKeyEnvelope(c, null)
+				purchaseCurrencyId = currency.CurrencyId
+			}
+
+			const maxPrice =
+				purchaseCurrencyId === null ? MAX_KEY_PRICE_TOKENS : MAX_KEY_PRICE_ROOM_CURRENCY
+			if (price > maxPrice) return roomKeyEnvelope(c, null)
+
+			// Blank is a value here too: no art. Only absence leaves the stored name alone.
+			const postedImageName = str(body.ImageName)?.trim()
+			const imageName = postedImageName === undefined ? existing.ImageName : postedImageName || null
+
+			const description = str(body.Description)
+			return roomKeyEnvelope(
+				c,
+				await updateRoomKey(c.env.DB, roomKeyId, {
+					Name: name === undefined ? existing.Name : censorSwears(name),
+					Description: description === undefined ? existing.Description : censorSwears(description),
+					Price: price,
+					PurchaseCurrencyId: purchaseCurrencyId,
+					ImageName: imageName,
+				})
+			)
 		}
 	)
 

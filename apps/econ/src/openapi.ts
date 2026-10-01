@@ -645,9 +645,9 @@ export const RoomKeyDto = z.object({
 	PurchaseCurrencyId: z
 		.string()
 		.nullable()
-		.describe('A `room_currency` id, or null — the create body names none'),
+		.describe('A `room_currency` id, or null for tokens — which a new key is priced in'),
 	CreatedAt: z.string().describe('ISO-8601 UTC'),
-	ImageName: z.string().nullable().describe('Null — a key cannot carry art yet'),
+	ImageName: z.string().nullable().describe('The key’s art; null until an edit sets one'),
 	Type: z.int().describe('The key type’s ordinal: 0 `Key`, the only one seen'),
 })
 
@@ -672,7 +672,37 @@ export const CreateRoomKeyRequest = z.object({
 	RoomId: z.string().describe('The room the key opens'),
 	Name: z.string().describe('Shown to players; profanity-masked like every typed string'),
 	Description: z.string().optional().describe('Defaults to empty'),
-	Price: z.string().optional().describe('What the key costs; defaults to 0'),
+	Price: z
+		.string()
+		.optional()
+		.describe('What the key costs, in tokens; defaults to 0. At most 1000'),
+})
+
+/**
+ * `PUT /api/roomkeys/v1/updateAll` — form-encoded. "All" is the FIELDS, not the keys: the body
+ * names one key and carries every editable field of it
+ * (`RoomKeyId=43&Name=key1&Description=…&Price=1000&PurchaseCurrencyId=`). For the two
+ * fields that can be emptied — `PurchaseCurrencyId` and `ImageName` — a BLANK value is an
+ * instruction to clear it; only a field absent from the body is left alone.
+ */
+export const UpdateRoomKeyRequest = z.object({
+	RoomKeyId: z.string().describe('The key to edit'),
+	Name: z.string().optional().describe('Left alone when absent; profanity-masked'),
+	Description: z.string().optional().describe('Left alone when absent; profanity-masked'),
+	Price: z
+		.string()
+		.optional()
+		.describe('Left alone when absent. At most 1000 in tokens, 1000000000 in a room currency'),
+	PurchaseCurrencyId: z
+		.string()
+		.optional()
+		.describe(
+			'EMPTY means tokens; otherwise a `room_currency` id of the key’s own room. Left alone when absent'
+		),
+	ImageName: z
+		.string()
+		.optional()
+		.describe('The key’s art. EMPTY clears it (served as null). Left alone when absent'),
 })
 
 /**
