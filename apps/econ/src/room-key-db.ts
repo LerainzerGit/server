@@ -9,6 +9,8 @@
  *  - `GET  /api/roomkeys/v1/room?roomId=` lists a room's
  *  - `PUT  /api/roomkeys/v1/updateAll` edits one
  *  - `POST /api/roomkeys/v1/awardbulk` awards the caller some
+ *  - `GET  /api/storefronts/v1/buyRoomKey` sells the caller one, for tokens
+ *  - `POST /api/storefronts/v1/PurchaseRoomKeyWithCurrency` sells one for its room currency
  *  - `POST /api/roomkeys/v1/owns/bulk` says who holds which
  *
  * This worker (`econ`) owns the tables and their migrations — see apps/econ/migrations/0024
@@ -254,4 +256,49 @@ export async function ownsRoomKeys(db: D1Database, pairs: RoomKeyHolding[]): Pro
 		pairs.map((pair) => held.bind(pair.RoomKeyId, pair.AccountId))
 	)
 	return results.map((r) => r.results.length > 0)
+}
+
+/**
+ * Take a key for a player ahead of charging them for it: true when this call made them its
+ * holder, false when they already were (or the key is gone). The insert is the atomic step
+ * a sale hangs on — two concurrent buys of one key cannot both claim it, so only one is
+ * charged. A sale that then fails to collect gives the key back with {@link releaseRoomKey}.
+ */
+export async function claimRoomKey(
+	db: D1Database,
+	accountId: number,
+	roomKeyId: number
+): Promise<boolean> {
+	const { meta } = await db
+		.prepare(
+			`INSERT OR IGNORE INTO room_key_player (room_key_id, account_id, awarded_at)
+			 SELECT room_key_id, ?2, ?3 FROM room_key WHERE room_key_id = ?1`
+		)
+		.bind(roomKeyId, accountId, new Date().toISOString())
+		.run()
+	return meta.changes > 0
+}
+
+/** Undo a {@link claimRoomKey} whose sale did not go through. */
+export async function releaseRoomKey(
+	db: D1Database,
+	accountId: number,
+	roomKeyId: number
+): Promise<void> {
+	await db
+		.prepare('DELETE FROM room_key_player WHERE room_key_id = ?1 AND account_id = ?2')
+		.bind(roomKeyId, accountId)
+		.run()
+}
+
+/**
+ * Who a room's key sales pay — the room's `CreatorAccountId`, read off the `room` table's
+ * generated column (the `rooms` worker owns the table). Null when there is no such room.
+ */
+export async function getRoomOwnerId(db: D1Database, roomId: number): Promise<number | null> {
+	const row = await db
+		.prepare('SELECT creator_account_id FROM room WHERE room_id = ?1')
+		.bind(roomId)
+		.first<{ creator_account_id: number | null }>()
+	return row?.creator_account_id ?? null
 }
