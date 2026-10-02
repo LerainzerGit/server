@@ -2123,6 +2123,35 @@ describe('public endpoints', () => {
 		expect(await res.json()).toEqual([])
 	})
 
+	test('GET /api/inventions/v2/mine serves a v3-published invention as public', async () => {
+		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('5149')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Published the old way', inventionDataFilename: 'a.inv' }),
+		})
+		const { Invention } = (await save.json()) as InventionSaveResult
+		await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v3/publish?inventionId=${Invention.InventionId}`,
+			{ headers: await bearer('5149') }
+		)
+
+		// `v3/publish` names no accessibility, so the record keeps the 0 a save mints. The
+		// 2025 client has no `IsPublished` to read, only `Accessibility` — 0 is Private.
+		const mine = await exports.default.fetch(`${ORIGIN}/api/inventions/v2/mine`, {
+			headers: await bearer('5149'),
+		})
+		expect((await mine.json()) as SavedInvention[]).toMatchObject([
+			{ InventionId: Invention.InventionId, IsPublished: true, Accessibility: 1 },
+		])
+
+		// Published, so it would otherwise turn up in the feeds the later tests count.
+		await exports.default.fetch(`${ORIGIN}/api/inventions/v2/delete`, {
+			method: 'POST',
+			headers: { ...(await bearer('5149')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ InventionId: Invention.InventionId }),
+		})
+	})
+
 	test('POST /api/inventions/v6/save persists the invention and lists it in mine', async () => {
 		const body = {
 			name: '071126 13:10:50',
@@ -2192,6 +2221,19 @@ describe('public endpoints', () => {
 		expect(mine.status).toBe(200)
 		const list = (await mine.json()) as SavedInvention[]
 		expect(list.map((i) => i.InventionId)).toContain(saved.InventionId)
+		// The 2025 client decodes this list into its flat `RRInvention`, so every key of
+		// that DTO is present even on a v6 record that stores none of them — and the keys
+		// the older client reads are still there beside them.
+		expect(list.find((i) => i.InventionId === saved.InventionId)).toMatchObject({
+			UgcVersion: 1,
+			LatestVersionNumber: 1,
+			ForceCannotPublish: false,
+			IsRecRoomApproved: false,
+			DisplayMetadataJson: null,
+			Accessibility: 0,
+			IsPublished: false,
+			CurrentVersion: { VersionNumber: 1 },
+		})
 
 		// The saved invention is fetchable by id via the v1 lookup.
 		const one = await exports.default.fetch(
@@ -2311,7 +2353,7 @@ describe('public endpoints', () => {
 		expect(res.status).toBe(200)
 		const value = ((await res.json()) as InventionSaveV9Result).Value
 		if (value === null) throw new Error('Value must not be null on a successful save')
-		expect(value.Invention.UgcVersion).toBe(0)
+		expect(value.Invention.UgcVersion).toBe(1)
 		expect(value.Invention.DisplayMetadataJson).toBeNull()
 		// A save always mints a version; the key is nullable only because econ's
 		// `v3/buyInvention` answers in this same envelope and a buy mints none.
@@ -2795,7 +2837,7 @@ describe('public endpoints', () => {
 			.run()
 	})
 
-	test('POST /api/inventions/v4/publish keeps an unlisted invention out of the feeds', async () => {
+	test('POST /api/inventions/v4/publish keeps an unlisted invention out of the store, and v2/unpublish undoes it', async () => {
 		const save = await exports.default.fetch(`${ORIGIN}/api/inventions/v9/save`, {
 			method: 'POST',
 			headers: { ...(await bearer('5171')), 'Content-Type': 'application/json' },
@@ -2815,8 +2857,8 @@ describe('public endpoints', () => {
 		const value = ((await res.json()) as InventionSaveV9Result).Value
 		expect(value?.Invention.Accessibility).toBe(2)
 
-		// Unlisted is published — it is reachable by id, which is the whole point of it —
-		// but it is not something anyone comes across.
+		// Unlisted is published — on the creator's portfolio and reachable by id — but it is
+		// not in the store: search and the feeds leave it out.
 		const one = await exports.default.fetch(
 			`${ORIGIN}/api/inventions/v1?inventionId=${inventionId}`
 		)
@@ -2830,6 +2872,39 @@ describe('public endpoints', () => {
 		expect(await found.json()).toEqual([])
 		const room = await exports.default.fetch(`${ORIGIN}/api/inventions/v1/room?id=4171`)
 		expect(await room.json()).toEqual([])
+		const portfolio = async (): Promise<number[]> =>
+			(
+				(await (
+					await exports.default.fetch(`${ORIGIN}/api/inventions/v1/fromcreators?id=5171`)
+				).json()) as SavedInvention[]
+			).map((i) => i.InventionId)
+		expect(await portfolio()).toEqual([inventionId])
+
+		// Unpublishing is creator only, and puts back what a save mints: not published,
+		// Accessibility 0 — off the portfolio, still on the creator's own shelf.
+		const unpublish = async (who: string): Promise<InventionSaveV9Result> =>
+			(await (
+				await exports.default.fetch(`${ORIGIN}/api/inventions/v2/unpublish`, {
+					method: 'POST',
+					headers: { ...(await bearer(who)), 'Content-Type': 'application/json' },
+					body: JSON.stringify({ InventionId: inventionId }),
+				})
+			).json()) as InventionSaveV9Result
+		expect((await unpublish('5199')).Success).toBe(false)
+		expect(await portfolio()).toEqual([inventionId])
+
+		const undone = await unpublish('5171')
+		expect(undone.Success).toBe(true)
+		expect(undone.Value?.Invention.Accessibility).toBe(0)
+		expect(await portfolio()).toEqual([])
+		const stored = (await (
+			await exports.default.fetch(`${ORIGIN}/api/inventions/v2/mine`, {
+				headers: await bearer('5171'),
+			})
+		).json()) as SavedInvention[]
+		const shelved = stored.find((i) => i.InventionId === inventionId)
+		expect(shelved).toMatchObject({ IsPublished: false, Accessibility: 0 })
+		expect(shelved?.FirstPublishedAt).not.toBeNull()
 	})
 
 	test('POST /api/inventions/v4/publish leaves a price and a first-publish date alone', async () => {
@@ -4277,24 +4352,87 @@ describe('public endpoints', () => {
 		expect(await price(cheap)).toBe(50)
 	})
 
-	test('GET /api/inventions/v1/fromcreators is an empty feed for now', async () => {
-		// A stub: the client renders an empty array as "this creator has published nothing",
-		// where a 404 would read as a row that failed to load.
-		const res = await exports.default.fetch(
-			`${ORIGIN}/api/inventions/v1/fromcreators?id=207&skip=0&take=100`
-		)
-		expect(res.status).toBe(200)
-		expect(await res.json()).toEqual([])
+	test('GET /api/inventions/v1/fromcreators lists a creator’s public inventions', async () => {
+		const json = async (creator: string, path: string, body: unknown): Promise<Response> =>
+			exports.default.fetch(`${ORIGIN}${path}`, {
+				method: 'POST',
+				headers: { ...(await bearer(creator)), 'Content-Type': 'application/json' },
+				body: JSON.stringify(body),
+			})
+		const save = async (creator: string, name: string): Promise<number> => {
+			const res = await json(creator, '/api/inventions/v9/save', {
+				name,
+				inventionDataFilename: 'portfolio.inv',
+				ugcVersion: 1,
+			})
+			const id = ((await res.json()) as InventionSaveV9Result).Value?.Invention.InventionId
+			if (id === undefined) throw new Error('save failed')
+			return id
+		}
+		const publish = (creator: string, id: number, accessibility: number): Promise<Response> =>
+			json(creator, '/api/inventions/v4/publish', {
+				InventionId: id,
+				Permission: 20,
+				Accessibility: accessibility,
+			})
 
-		// The params are accepted and ignored, including a repeated `id` and none at all.
-		expect(
-			await (
-				await exports.default.fetch(`${ORIGIN}/api/inventions/v1/fromcreators?id=1&id=2`)
-			).json()
-		).toEqual([])
-		expect(
-			await (await exports.default.fetch(`${ORIGIN}/api/inventions/v1/fromcreators`)).json()
-		).toEqual([])
+		const draft = await save('5301', 'Portfolio Draft')
+		const listed = await save('5301', 'Portfolio Public')
+		const unlisted = await save('5301', 'Portfolio Unlisted')
+		const legacy = await save('5301', 'Portfolio Legacy')
+		const other = await save('5302', 'Other Creator')
+		await publish('5301', listed, 1)
+		await publish('5301', unlisted, 2)
+		await publish('5302', other, 1)
+		// `v3/publish` names no accessibility, so the record keeps the 0 a save mints.
+		await exports.default.fetch(`${ORIGIN}/api/inventions/v3/publish?inventionId=${legacy}`, {
+			headers: await bearer('5301'),
+		})
+
+		const shelf = async (query: string): Promise<SavedInvention[]> =>
+			(await (
+				await exports.default.fetch(`${ORIGIN}/api/inventions/v1/fromcreators?${query}`)
+			).json()) as SavedInvention[]
+
+		// Published is what lists an invention here, whatever its accessibility: the draft
+		// is not on the shelf, the Unlisted one is — and the `v3/publish` one, which stores
+		// the 0 a save mints, is served as Public.
+		const mine = await shelf('id=5301&skip=0&take=100')
+		expect(mine.map((i) => i.InventionId)).toEqual([legacy, unlisted, listed])
+		expect(mine.map((i) => i.Accessibility)).toEqual([1, 2, 1])
+
+		// The creator gets the same shelf as anyone: their drafts are `v2/mine`'s alone.
+		const own = (await (
+			await exports.default.fetch(`${ORIGIN}/api/inventions/v1/fromcreators?id=5301`, {
+				headers: await bearer('5301'),
+			})
+		).json()) as SavedInvention[]
+		expect(own.map((i) => i.InventionId)).not.toContain(draft)
+
+		// `id` repeats, newest first across creators, and skip/take page it.
+		expect((await shelf('id=5301&id=5302')).map((i) => i.InventionId)).toEqual([
+			other,
+			legacy,
+			unlisted,
+			listed,
+		])
+		expect((await shelf('id=5301&id=5302&skip=1&take=1')).map((i) => i.InventionId)).toEqual([
+			legacy,
+		])
+
+		// No creator, or one with nothing public, is an empty shelf rather than a 404.
+		expect(await shelf('')).toEqual([])
+		expect(await shelf('id=999999')).toEqual([])
+
+		// Published, so they would otherwise turn up in the feeds the later tests count.
+		for (const [creator, id] of [
+			['5301', listed],
+			['5301', unlisted],
+			['5301', legacy],
+			['5302', other],
+		] as const) {
+			await json(creator, '/api/inventions/v2/delete', { InventionId: id })
+		}
 	})
 
 	test('GET /api/inventions/v1/toptoday + v1/featured serve the invention feeds', async () => {
@@ -8738,9 +8876,7 @@ describe('player events', () => {
 		])
 
 		// Paging walks the sorted order, and an unknown sort is the default, not a 400.
-		expect(await search('?query=sortable&sort=Attendance&skip=1&take=1')).toEqual([
-			byAttendance[1],
-		])
+		expect(await search('?query=sortable&sort=Attendance&skip=1&take=1')).toEqual([byAttendance[1]])
 		const unknown = await get('/api/playerevents/v1/search?query=sortable&sort=Popularity')
 		expect(unknown.status).toBe(200)
 		expect(((await unknown.json()) as PlayerEvent[]).map((e) => e.PlayerEventId)).toEqual([
@@ -9924,6 +10060,7 @@ describe('openapi', () => {
 			'POST /api/inventions/v1/update',
 			'POST /api/inventions/v1/updateprice',
 			'POST /api/inventions/v2/delete',
+			'POST /api/inventions/v2/unpublish',
 			'POST /api/inventions/v2/update',
 			'POST /api/inventions/v4/publish',
 			'POST /api/inventions/v6/save',

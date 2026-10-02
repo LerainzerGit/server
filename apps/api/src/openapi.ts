@@ -567,7 +567,7 @@ export const InventionV9Dto = z.object({
 	Name: z.string(),
 	Description: z.string(),
 	ImageName: z.string(),
-	UgcVersion: z.int().describe('The UGC format the blob was written in; 0 when unsent'),
+	UgcVersion: z.int().describe('The UGC format the blob was written in; 1 when the save named none'),
 	CurrentVersionNumber: z.int(),
 	LatestVersionNumber: z.int().describe('The same as CurrentVersionNumber on a fresh save'),
 	Accessibility: z.int(),
@@ -760,7 +760,7 @@ export const PublishInventionRequest = z.object({
 		.int()
 		.nullable()
 		.optional()
-		.describe('Private 0, Public 1, Unlisted 2. Unlisted stays out of browse and search'),
+		.describe('Public 1 publishes it into the store; Unlisted 2 publishes it but keeps it out of search and the feeds'),
 	Price: z
 		.int()
 		.nullable()
@@ -769,6 +769,11 @@ export const PublishInventionRequest = z.object({
 			'Price in tokens, at most 1000 (MAX_INVENTION_PRICE); null leaves it as it is, a ' +
 				'negative one is ignored, and one over the cap refuses the publish'
 		),
+})
+
+/** `POST /api/inventions/v2/unpublish` JSON body — the id and nothing else. */
+export const UnpublishInventionRequest = z.object({
+	InventionId: z.int().describe('The invention to unpublish; the caller must have created it'),
 })
 
 /** `POST /api/inventions/v2/delete` JSON body — the id and nothing else. */
