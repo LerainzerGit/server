@@ -1389,6 +1389,10 @@ function roomRedirects(env: Env): Map<number, string> {
  * default subroom. Substitution is a single hop — `2=3,3=2` swaps the two rooms rather
  * than looping — and an unresolvable target leaves the original room in place, so a
  * typo'd knob degrades to "no substitution" instead of a dead hub.
+ *
+ * Only builds NEWER than the 2023 client ({@link BUILD_2023}) are substituted. A caller on
+ * that build or an older one — or on a token that names none, which matchmakes as
+ * `GAME_VERSION` (see {@link callerGameVersion}) — enters the room they asked for.
  */
 async function substituteRoom(
 	c: Context<App>,
@@ -1398,6 +1402,9 @@ async function substituteRoom(
 	const fromId = typeof room.RoomId === 'number' ? room.RoomId : NaN
 	const to = roomRedirects(c.env).get(fromId)
 	if (to === undefined) return { room, subRoomId }
+
+	const build = buildNumber(await callerGameVersion(c))
+	if (build === null || build <= BUILD_2023) return { room, subRoomId }
 
 	const toId = Number.parseInt(to, 10)
 	const target = Number.isNaN(toId)

@@ -1132,12 +1132,14 @@ describe('public endpoints', () => {
 	test('ROOM_REDIRECTS switches a matchmake out to another room', async () => {
 		// `env` is shared by every test in this file, so restore the knob in `finally`.
 		const original = env.ROOM_REDIRECTS
-		const matchmake = async (path: string, player: string) =>
+		// Substitution only applies to builds newer than 20230414, so matchmake as the 2025 one
+		// unless the case says otherwise.
+		const matchmake = async (path: string, player: string, version = '20250718.01') =>
 			(await (
 				await exports.default.fetch(`${ORIGIN}${path}`, {
 					method: 'POST',
 					headers: {
-						...(await bearer(player)),
+						...(await bearer(player, version)),
 						'Content-Type': 'application/x-www-form-urlencoded',
 					},
 					// Private, so each call gets a fresh instance of whatever room it landed in.
@@ -1172,6 +1174,21 @@ describe('public endpoints', () => {
 			// substituted room is substituted wherever a matchmake names it.
 			expect((await matchmake('/matchmake/club/4', '121')).roomInstance).toMatchObject({
 				roomId: 77,
+			})
+
+			// The 2023 build and anything older is never substituted, nor is a token naming no
+			// build (it matchmakes as GAME_VERSION): they enter the room they asked for.
+			for (const [player, version] of [
+				['8808', '20230414'],
+				['8809', '20230414.01'],
+				['8810', '20221117'],
+			]) {
+				expect((await matchmake('/matchmake/room/2', player, version)).roomInstance).toMatchObject(
+					{ roomId: 2, name: '^RecCenter' }
+				)
+			}
+			expect((await matchmake('/matchmake/room/2', '8811', '')).roomInstance).toMatchObject({
+				roomId: 2,
 			})
 
 			// Targeting by id works the same, and substitution is a single hop: 2 and 77
