@@ -2675,9 +2675,8 @@ interface SettledInventionPurchase {
  *
  * Ownership is recorded in `inventory_invention`; the creator is not sold their own
  * invention (they own it already, via CreatorPlayerId) and a re-buy is a 409 rather
- * than a second row. The invention’s `NumDownloads` counter is deliberately NOT
- * bumped: that column lives on the `invention` table the `api` worker owns, and this
- * worker only reads it.
+ * than a second row. The grant also resyncs the invention’s `NumDownloads` — the count
+ * of players who have it — and the invention returned carries the new number.
  */
 async function settleInventionPurchase(
 	c: Context<App>,
@@ -2723,7 +2722,7 @@ async function settleInventionPurchase(
 	// around them, so order them by what a failure costs. A buyer who paid and got the
 	// invention but left the creator unpaid is recoverable; a buyer charged for nothing
 	// is not.
-	await grantInvention(c.env.DB, id, inventionId)
+	const downloads = await grantInvention(c.env.DB, id, inventionId)
 
 	if (price > 0) {
 		// Seed the creator's signup grant BEFORE crediting them: `creditCurrency` upserts
@@ -2760,7 +2759,7 @@ async function settleInventionPurchase(
 	if (price > 0) {
 		await pushBalancePurchase(c, id, CurrencyType.RecCenterTokens, -price, balance)
 	}
-	return { invention, balance }
+	return { invention: { ...invention, NumDownloads: downloads }, balance }
 }
 
 // strict: false so trailing-slash routes (e.g. `/gifts/consume/`, which the client

@@ -5054,7 +5054,7 @@ describe('econ endpoints', () => {
 			}
 			InventionResponse: {
 				Status: number
-				Invention: { InventionId: number; Name: string }
+				Invention: { InventionId: number; Name: string; NumDownloads: number }
 				InventionVersion: { InventionId: number; VersionNumber: number }
 			}
 		}
@@ -5070,9 +5070,22 @@ describe('econ endpoints', () => {
 
 		expect(await getOwnedInventionIds(env.DB, 50)).toEqual([8])
 
-		// Owning an invention is boolean: buying it again is a conflict, not a second row.
+		// `NumDownloads` is the number of players who have it, re-derived on the grant:
+		// the response carries it and so does the stored record.
+		const storedDownloads = async (): Promise<number> =>
+			(
+				await env.DB.prepare(
+					"SELECT json_extract(data, '$.NumDownloads') AS n FROM invention WHERE id = 8"
+				).first<{ n: number }>()
+			)?.n ?? -1
+		expect(body.InventionResponse.Invention.NumDownloads).toBe(1)
+		expect(await storedDownloads()).toBe(1)
+
+		// Owning an invention is boolean: buying it again is a conflict, not a second row —
+		// and not a second download.
 		expect((await buyInvention('50', 8)).status).toBe(409)
 		expect(await getOwnedInventionIds(env.DB, 50)).toEqual([8])
+		expect(await storedDownloads()).toBe(1)
 	})
 
 	test('GET /api/storefronts/v2/buyInvention pays the creator the buyer’s tokens', async () => {
