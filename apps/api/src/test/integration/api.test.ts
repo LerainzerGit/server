@@ -3914,6 +3914,50 @@ describe('public endpoints', () => {
 		expect(noId.status).toBe(400)
 	})
 
+	test('POST /api/inventions/v2/cheer is v1/cheer in the newer client’s envelope', async () => {
+		const saved = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
+			method: 'POST',
+			headers: { ...(await bearer('8210')), 'Content-Type': 'application/json' },
+			body: JSON.stringify({ name: 'Cheerable Sofa', inventionDataFilename: 'cheerable2.inv' }),
+		})
+		const { InventionId } = ((await saved.json()) as InventionSaveResult).Invention
+		const cheer = async (body: unknown, sub?: string) =>
+			exports.default.fetch(`${ORIGIN}/api/inventions/v2/cheer`, {
+				method: 'POST',
+				headers: { ...(sub ? await bearer(sub) : {}), 'Content-Type': 'application/json' },
+				body: JSON.stringify(body),
+			})
+		const stored = async (): Promise<number> =>
+			(
+				(await (
+					await exports.default.fetch(`${ORIGIN}/api/inventions/v1?inventionId=${InventionId}`)
+				).json()) as SavedInvention
+			).CheerCount
+		const ok = { Value: null, Success: true, Error: null, error_id: null }
+
+		const anonymous = await cheer({ InventionId, Cheer: true })
+		expect(anonymous.status).toBe(401)
+		expect(await anonymous.json()).toMatchObject({ Value: null, Success: false })
+
+		expect(await (await cheer({ InventionId, Cheer: true }, '44')).json()).toEqual(ok)
+		expect(await (await cheer({ InventionId, Cheer: true }, '44')).json()).toEqual(ok)
+		expect(await stored()).toBe(1)
+		const personal = await exports.default.fetch(
+			`${ORIGIN}/api/inventions/v1/personaldetails/${InventionId}`,
+			{ headers: await bearer('44') }
+		)
+		expect(await personal.json()).toEqual({ IsCheering: true })
+
+		expect(await (await cheer({ InventionId, Cheer: false }, '44')).json()).toEqual(ok)
+		expect(await stored()).toBe(0)
+
+		// Refusals stay in the envelope, at 200.
+		const unknown = await cheer({ InventionId: 999999, Cheer: true }, '44')
+		expect(unknown.status).toBe(200)
+		expect(await unknown.json()).toMatchObject({ Success: false, Error: 'No such invention' })
+		expect(await (await cheer({ InventionId }, '44')).json()).toMatchObject({ Success: false })
+	})
+
 	test('POST /api/inventions/v1/cheer persists and personaldetails reflects it', async () => {
 		const saved = await exports.default.fetch(`${ORIGIN}/api/inventions/v6/save`, {
 			method: 'POST',
@@ -10059,6 +10103,7 @@ describe('openapi', () => {
 			'POST /api/inventions/v1/settags',
 			'POST /api/inventions/v1/update',
 			'POST /api/inventions/v1/updateprice',
+			'POST /api/inventions/v2/cheer',
 			'POST /api/inventions/v2/delete',
 			'POST /api/inventions/v2/unpublish',
 			'POST /api/inventions/v2/update',

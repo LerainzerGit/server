@@ -1897,6 +1897,49 @@ export const avatarRoutes = new Hono<App>({ strict: false })
 			return c.json({ success: true, error: '' })
 		}
 	)
+	// The newer client's cheer: the same body as `v1/cheer` and the same write, at a new
+	// path. It answers the `{ Value, Success, Error, error_id }` envelope the other v2+
+	// invention routes use, refusals in-band — an ASSUMPTION: only the request has been
+	// observed, not what the client reads off the reply.
+	.post(
+		'/api/inventions/v2/cheer',
+		describeRoute({
+			tags: ['Inventions'],
+			summary: 'Cheer or un-cheer an invention (v2)',
+			description:
+				'`v1/cheer` for the newer client: persists the caller’s cheer state and resyncs ' +
+				'the invention’s `CheerCount`; repeating the same state is idempotent. Answers ' +
+				'the `{ Value, Success, Error, error_id }` envelope with `Value` null, and a ' +
+				'refusal — a bad body, an unknown invention — is `Success: false` with a message ' +
+				'rather than an error status.',
+			security: AUTHED,
+			requestBody: jsonBody(InventionCheerRequest, 'The invention and new cheer state'),
+			responses: {
+				200: json(InventionDeleteResult, 'The envelope, `Value` null either way'),
+				401: json(InventionDeleteResult, 'The same envelope, refused — not an empty body'),
+			},
+		}),
+		async (c) => {
+			const playerId = await authedId(c)
+			if (playerId === null) return c.json(inventionDeleteResult('Unauthorized'), 401)
+			const body = await c.req
+				.json<{ InventionId?: unknown; Cheer?: unknown }>()
+				.catch(() => ({}) as Record<string, unknown>)
+			const inventionId = body.InventionId
+			if (
+				typeof inventionId !== 'number' ||
+				!Number.isInteger(inventionId) ||
+				typeof body.Cheer !== 'boolean'
+			) {
+				return c.json(inventionDeleteResult('InventionId and Cheer are required'))
+			}
+			if ((await getInventionById(c.env.DB, inventionId)) === null) {
+				return c.json(inventionDeleteResult('No such invention'))
+			}
+			await setInventionCheer(c.env.DB, playerId, inventionId, body.Cheer)
+			return c.json(inventionDeleteResult())
+		}
+	)
 	// Report an invention. Stored in the `report` table the player and event reports use —
 	// same fields, same moderation life — with `invention_id` set. See
 	// migrations/0016_report_invention.sql.
