@@ -3032,6 +3032,105 @@ describe('auth-gated endpoints', () => {
 		expect((await v2('/matchmake/v2/room/2', '9880', 2)).RoomInstance?.RoomId).toBe(2)
 	})
 
+	test('an unpublished room’s instances are always PRIVATE, whatever JoinMode asked for', async () => {
+		type V2 = {
+			ErrorCode: number
+			RoomInstance: { RoomInstanceId: number; RoomId: number; IsPrivate: boolean } | null
+		}
+		const v2 = async (path: string, sub: string, joinMode: number) =>
+			(await (
+				await exports.default.fetch(`${ORIGIN}${path}`, {
+					method: 'POST',
+					headers: { ...(await bearer(sub)), 'Content-Type': 'application/json' },
+					body: JSON.stringify({ JoinMode: joinMode }),
+				})
+			).json()) as V2
+		const stored = async (instanceId: number | undefined) =>
+			(
+				await env.DB.prepare('SELECT is_private FROM room_instance WHERE id = ?1')
+					.bind(instanceId ?? 0)
+					.first<{ is_private: number }>()
+			)?.is_private
+
+		// The creator walking through their own room's subroom door posts JoinMode 0 — the
+		// body the client was seen sending. Room 6 is Private, so the session is too: in the
+		// answer, and in the row every other route reads.
+		const own = await v2('/matchmake/v2/room/6/6', '42', 0)
+		expect(own.ErrorCode).toBe(0)
+		expect(own.RoomInstance).toMatchObject({ RoomId: 6, IsPrivate: true })
+		expect(await stored(own.RoomInstance?.RoomInstanceId)).toBe(1)
+		// The 2023 spelling, and JoinMode 1, are the same.
+		const v1 = (await (
+			await exports.default.fetch(`${ORIGIN}/matchmake/room/6`, {
+				method: 'POST',
+				headers: { ...(await bearer('42')), 'Content-Type': 'application/x-www-form-urlencoded' },
+				body: 'JoinMode=1',
+			})
+		).json()) as { roomInstance: { roomInstanceId: number; isPrivate: boolean } | null }
+		expect(v1.roomInstance?.isPrivate).toBe(true)
+		expect(await stored(v1.roomInstance?.roomInstanceId)).toBe(1)
+
+		// Nothing public to reuse: a role holder asking for a public session gets a private
+		// one of their own rather than joining the creator's.
+		const host = await v2('/matchmake/v2/room/6', '44', 0)
+		expect(host.RoomInstance?.IsPrivate).toBe(true)
+		expect(host.RoomInstance?.RoomInstanceId).not.toBe(v1.roomInstance?.roomInstanceId)
+		expect(
+			await env.DB.prepare(
+				'SELECT COUNT(*) AS n FROM room_instance WHERE room_id = 6 AND is_private = 0'
+			).first<{ n: number }>()
+		).toEqual({ n: 0 })
+
+		// A FRIEND of the creator is not one of the room's people: neither follow gets them
+		// in — the 2023 route by the room's gate, the v2 route because the session is private.
+		await env.DB.prepare(
+			'INSERT INTO relationship (requester_id, target_id, relationship_type) VALUES (42, 9885, 3)'
+		).run()
+		try {
+			const follow = (await (
+				await exports.default.fetch(`${ORIGIN}/matchmake/player/42`, {
+					method: 'POST',
+					headers: await bearer('9885'),
+				})
+			).json()) as { errorCode: number; roomInstance: unknown }
+			expect(follow).toEqual(refused(20))
+			const followV2 = (await (
+				await exports.default.fetch(`${ORIGIN}/matchmake/v2/player/42`, {
+					method: 'POST',
+					headers: { ...(await bearer('9885')), 'Content-Type': 'application/json' },
+					body: '{}',
+				})
+			).json()) as V2
+			expect(followV2.ErrorCode).not.toBe(0)
+			expect(followV2.RoomInstance).toBeNull()
+			expect(
+				await env.DB.prepare('SELECT 1 AS hit FROM presence WHERE account_id = 9885').first()
+			).toBeNull()
+
+			// One of the room's own people who is also a friend may follow: the room admits
+			// them itself. Here the creator follows the Host into the Host's session.
+			await env.DB.prepare(
+				'INSERT INTO relationship (requester_id, target_id, relationship_type) VALUES (42, 44, 3)'
+			).run()
+			const ownFollow = (await (
+				await exports.default.fetch(`${ORIGIN}/matchmake/player/44`, {
+					method: 'POST',
+					headers: await bearer('42'),
+				})
+			).json()) as { errorCode: number; roomInstance: { roomInstanceId: number } | null }
+			expect(ownFollow.errorCode).toBe(0)
+			expect(ownFollow.roomInstance?.roomInstanceId).toBe(host.RoomInstance?.RoomInstanceId)
+		} finally {
+			await env.DB.prepare(
+				'DELETE FROM relationship WHERE requester_id = 42 AND target_id IN (9885, 44)'
+			).run()
+		}
+
+		// A published room still hands out a public session for the same request.
+		const open = await v2('/matchmake/v2/room/2', '9885', 0)
+		expect(open.RoomInstance?.IsPrivate).toBe(false)
+	})
+
 	test('POST /matchmake/room/:roomId refuses a player banned from the room', async () => {
 		const matchmake = async (sub: string) =>
 			(await (
