@@ -139,6 +139,7 @@ import {
 	RoomEconConfig,
 	RoomKeyDto,
 	RoomKeyEnvelope,
+	RoomPurchasableList,
 	RRPlusSignUpBonus,
 	SaveOutfitRequest,
 	SaveOutfitV4Response,
@@ -182,6 +183,7 @@ import {
 	releaseRoomKey,
 	updateRoomKey,
 } from './room-key-db'
+import { getRoomPurchasables } from './room-purchasables-db'
 
 import type { Context } from 'hono'
 import type { GiftContent, Outfit, Progression, StoredGift, XpGrant } from '@repo/domain'
@@ -4483,14 +4485,37 @@ const app = new Hono<App>({ strict: false })
 		}
 	)
 
-	// The UGC items a room sells (the creator-made things on sale inside it). Same empty
-	// stub as the room-economy routes above and asked for on the same room load: nothing
-	// stores room UGC purchasables yet, and an empty list reads as "this room sells
-	// nothing" where a 404 stalls the load.
+	// Everything a room sells, in one list: its keys, its consumables and the purchase offers
+	// of its currencies, each as the client's 10-key `UgcPurchasableItem` with `ItemType`
+	// saying which (0 key, 1 consumable, 3 currency pack). Asked for on every room load. A
+	// room that sells nothing is `[]` — the client's decoder throws on `{}` or an empty body.
 	.get(
-		'/api/ugcPurchasables/v1/items/room/:roomId',
-		listRoute('A room’s UGC purchasables', 'Empty stub so the client doesn’t 404'),
-		(c) => c.json([])
+		'/api/ugcPurchasables/v1/items/room/:roomId{[0-9]+}',
+		describeRoute({
+			tags: ['Rooms'],
+			summary: 'A room’s purchasables',
+			description:
+				'The room’s shop as one flat list: its room keys (`ItemType` 0), room consumables ' +
+				'(1) and the purchase offers of each of its currencies (3), assembled from the ' +
+				'`room_key`, `room_consumable` and `room_currency` tables. `ItemId` is a bare GUID ' +
+				'— a key’s `ReplicationId`, a consumable’s `RoomConsumableId`, an offer’s ' +
+				'`CurrencyPurchaseOfferId` — with the kind beside it as `ItemType`, not the ' +
+				'`{ itemType, itemId }` struct the bulk lookup takes. `PurchaseCurrencyId` is the ' +
+				'room currency a line is charged in, or null for tokens (every currency pack). A room ' +
+				'that sells nothing is an empty array.',
+			parameters: [
+				{
+					name: 'roomId',
+					in: 'path',
+					required: true,
+					description: 'The room whose shop to list',
+					schema: { type: 'string', pattern: '^[0-9]+$' },
+				},
+			],
+			responses: { 200: json(RoomPurchasableList, 'The room’s shop') },
+		}),
+		async (c) =>
+			c.json(await getRoomPurchasables(c.env.DB, Number.parseInt(c.req.param('roomId'), 10)))
 	)
 
 	// Bulk lookup of UGC purchasables by `{ itemType, itemId }`. Only custom avatar items
