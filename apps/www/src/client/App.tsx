@@ -27,9 +27,11 @@ import {
 	usernamesFor,
 	where,
 } from './api'
+import { DeviceLinkPage } from './DeviceLink'
 import { customAvatarItemIdFromPath, ItemPage } from './Item'
 import { ModerationPage } from './Moderation'
 import { StatsPage } from './Stats'
+import { StudioAccessPage } from './StudioAccess'
 
 import type { ReactNode } from 'react'
 import type { Hosts } from './api'
@@ -1598,6 +1600,10 @@ export function App() {
 					navigate={navigate}
 					onAuthed={setAccount}
 				/>
+			) : path === '/device' ? (
+				// Studio opens this from verification_uri_complete. The code was minted by
+				// auth; this page only approves it with the website session.
+				<DeviceLinkPage account={account} search={search} navigate={navigate} />
 			) : path === '/account' ? (
 				<AccountPage account={account} config={config} navigate={navigate} onChange={setAccount} />
 			) : path === '/claim' ? (
@@ -1615,6 +1621,12 @@ export function App() {
 				// on any of them falls through to the SPA shell; the page then gates itself on
 				// the token's role, and every endpoint behind it re-checks.
 				<ModerationPage account={account} path={path} search={search} navigate={navigate} />
+			) : path === '/settings/recroomstudio' || path === '/settings/recroomstudio/' ? (
+				// The URL Studio already opens from the "not authorized to upload" dialog.
+				// A client-side route like /moderation: not in run_worker_first, so a cold
+				// load falls through to the SPA shell. The page shows one account's own
+				// status to whoever is signed in, and the whitelist editor only to staff.
+				<StudioAccessPage account={account} navigate={navigate} />
 			) : path === '/stats' ? (
 				// Unlinked on purpose — nothing in the nav or footer points here; it's for whoever
 				// is handed the URL. Public all the same, and a client-side route like the rest:
@@ -1704,6 +1716,19 @@ function NavBar({
 								}
 							>
 								Moderation
+							</Link>
+						)}
+						{isAdmin() && (
+							<Link
+								to="/settings/recroomstudio"
+								navigate={navigate}
+								className={
+									path === '/settings/recroomstudio' || path === '/settings/recroomstudio/'
+										? 'active'
+										: ''
+								}
+							>
+								Studio access
 							</Link>
 						)}
 						<Link to="/account" navigate={navigate} className={path === '/account' ? 'active' : ''}>

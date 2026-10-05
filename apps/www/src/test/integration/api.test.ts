@@ -821,6 +821,14 @@ async function staffGet(path: string, accountId: number, roles: string[] = ['mod
 	})
 }
 
+/** DELETE a staff endpoint as a moderator (or whatever `roles` names). */
+async function staffDelete(path: string, accountId: number, roles: string[] = ['moderator']) {
+	return SELF.fetch(`https://example.com${path}`, {
+		method: 'DELETE',
+		headers: { authorization: `Bearer ${await tokenFor(accountId, roles)}` },
+	})
+}
+
 /** POST a JSON body to a staff endpoint as a moderator (or whatever `roles` names). */
 async function staffPost(
 	path: string,
@@ -854,6 +862,7 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		'/api/staff/bans',
 		'/api/staff/players/1',
 		'/api/staff/players/1/linked',
+		'/api/staff/studio-access',
 	]
 	const writes = [
 		'/api/staff/players/1/gift-tokens',
@@ -861,6 +870,7 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		'/api/staff/players/1/gift-xp',
 		'/api/staff/players/1/username-changes',
 		'/api/staff/players/1/clear-password',
+		'/api/staff/studio-access',
 		'/api/staff/players/1/grant-plus',
 	]
 	writes.push(
@@ -905,6 +915,16 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		body: JSON.stringify({ banned: true, days: 1 }),
 	})
 	expect(player.status).toBe(403)
+
+	const remove = await SELF.fetch('https://example.com/api/staff/studio-access/1', {
+		method: 'DELETE',
+	})
+	expect(remove.status).toBe(401)
+	const playerRemove = await SELF.fetch('https://example.com/api/staff/studio-access/1', {
+		method: 'DELETE',
+		headers: { authorization: `Bearer ${await tokenFor(8101, ['gameClient'])}` },
+	})
+	expect(playerRemove.status).toBe(403)
 })
 
 // The reporter is the CALLER, never a body field — that is the record of who raised a
@@ -2781,4 +2801,95 @@ it('decodes a bot member read: roles, gone, halt and error', async () => {
 			throw new TypeError('fetch failed')
 		})
 	).resolves.toEqual({ kind: 'error', status: null })
+})
+
+// ---- Studio upload access ---------------------------------------------------
+//
+// RecFlare Studio treats the JWT role `betastudio` as permission to upload. Staff
+// set the account's `hasStudio` flag here; auth stamps it onto the next login and
+// the next refresh. A signed-in player can ask about themselves. They cannot see or
+// edit the list.
+
+it('tells a signed-in player whether they can upload, and nobody else', async () => {
+	expect((await SELF.fetch('https://example.com/api/studio-access')).status).toBe(401)
+	const res = await SELF.fetch('https://example.com/api/studio-access', {
+		headers: { authorization: `Bearer ${await tokenFor(8601, ['gameClient'])}` },
+	})
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({ granted: false })
+})
+
+it('lets staff add, list, and remove studio upload access', async () => {
+	await updateAccount(env.DB, 8601, { username: 'StudioFan' })
+	await updateAccount(env.DB, 8602, { username: 'OtherFan' })
+	await updateAccount(env.DB, 8110, { username: 'Moderator' })
+
+	expect((await staffPost('/api/staff/studio-access', 8110, {})).status).toBe(400)
+	expect((await staffPost('/api/staff/studio-access', 8110, { username: 'Nobody' })).status).toBe(
+		404
+	)
+	expect(
+		(
+			await staffPost('/api/staff/studio-access', 8110, {
+				username: 'StudioFan',
+				accountId: 8602,
+			})
+		).status
+	).toBe(400)
+
+	const added = await staffPost('/api/staff/studio-access', 8110, { username: '@StudioFan' })
+	expect(added.status).toBe(200)
+	expect(await added.json()).toEqual({
+		accountId: 8601,
+		username: 'StudioFan',
+		granted: true,
+		alreadyGranted: false,
+	})
+
+	const again = await staffPost('/api/staff/studio-access', 8110, { accountId: 8601 })
+	expect(again.status).toBe(200)
+	expect(await again.json()).toMatchObject({ accountId: 8601, alreadyGranted: true })
+
+	const mine = await SELF.fetch('https://example.com/api/studio-access', {
+		headers: { authorization: `Bearer ${await tokenFor(8601, ['gameClient'])}` },
+	})
+	expect(await mine.json()).toEqual({ granted: true })
+
+	const list = await staffGet('/api/staff/studio-access', 8110)
+	expect(list.status).toBe(200)
+	const body = (await list.json()) as { accounts: Array<{ accountId: number }> }
+	expect(body.accounts).toEqual([
+		{ accountId: 8601, username: 'StudioFan', displayName: expect.any(String) },
+	])
+	expect((await getAccount(env.DB, 8601))?.hasStudio).toBe(true)
+
+	expect((await staffDelete('/api/staff/studio-access/nope', 8110)).status).toBe(400)
+	expect((await staffDelete('/api/staff/studio-access/8609', 8110)).status).toBe(404)
+
+	const removed = await staffDelete('/api/staff/studio-access/8601', 8110)
+	expect(removed.status).toBe(200)
+	expect(await removed.json()).toEqual({ accountId: 8601, granted: false, removed: true })
+	expect((await getAccount(env.DB, 8601))?.hasStudio).toBe(false)
+	const repeat = await staffDelete('/api/staff/studio-access/8601', 8110)
+	expect(await repeat.json()).toEqual({ accountId: 8601, granted: false, removed: false })
+
+	const after = await SELF.fetch('https://example.com/api/studio-access', {
+		headers: { authorization: `Bearer ${await tokenFor(8601, ['gameClient'])}` },
+	})
+	expect(await after.json()).toEqual({ granted: false })
+
+	expect(await auditRows('grant_studio_access', 8601)).toEqual([
+		{
+			actor: 8110,
+			data: { playerId: 8601, username: 'StudioFan', alreadyGranted: false },
+		},
+		{
+			actor: 8110,
+			data: { playerId: 8601, username: 'StudioFan', alreadyGranted: true },
+		},
+	])
+	expect(await auditRows('revoke_studio_access', 8601)).toEqual([
+		{ actor: 8110, data: { playerId: 8601, username: 'StudioFan', removed: true } },
+		{ actor: 8110, data: { playerId: 8601, username: 'StudioFan', removed: false } },
+	])
 })
