@@ -34,3 +34,15 @@ pnpm test
 ```sh
 pnpm turbo deploy
 ```
+
+### Migrate
+
+This worker owns `studio_cloud_build` and `studio_unity_asset_file` on the shared
+`recflare` database (`migrations/`, tracked in its own `d1_migrations_studio` table).
+Deploying does not apply them; the cdn worker reads `studio_unity_asset_file` and
+answers 404 for every Studio bundle until this has run.
+
+```sh
+just migrate -F studio             # remote
+just migrate -F studio -- --local  # dev db
+```
