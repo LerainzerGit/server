@@ -30,6 +30,7 @@ import {
 	getRoomInstancesByRoom,
 	getRoomInstanceSummariesByRoom,
 	getRoomInvite,
+	getSharedPrivateInstance,
 	getStoredRoomInstance,
 	hasRoomInviteTo,
 	InviteMode,
@@ -1486,10 +1487,16 @@ async function resolveRoomInstance(
 	// it never admitted — a friend follows the owner in, and `IsPrivate: false` tells every
 	// client the session is open. The owner walking through their own room's subroom door
 	// posts `JoinMode` 0, so this has to be decided here rather than trusted from the body.
-	// Private means a fresh instance each time, as `JoinMode` 2 always has: the room's
-	// people reach each other by invite. Room routes only, like the gate — an event or a
-	// clubhouse held in a private room is a session its own guest list shares.
-	const privateInstance = isPrivate || (gateOnAccessibility && !isPublished(room))
+	// Room routes only, like the gate — an event or a clubhouse held in a private room is a
+	// session its own guest list shares.
+	//
+	// It is also ONE session, not a fresh one per matchmake: an unpublished room has a
+	// single private instance (per subroom and build), and everyone the gate admits is
+	// placed in it — that is what "come look at my room" means to a co-owner. Spawning a
+	// fresh instance each time, as `JoinMode` 2 does on a published room, put the creator
+	// and each person they let in into separate empty copies of the room.
+	const unpublished = gateOnAccessibility && !isPublished(room)
+	const privateInstance = isPrivate || unpublished
 
 	// The build this player is on, from their token. A 2023 client can't load a scene
 	// saved at a newer persistence version, so it is refused the room outright (see
@@ -1510,23 +1517,34 @@ async function resolveRoomInstance(
 	// your current instance (e.g. the only public instance of a room you're already in)
 	// returns the same id and hangs the client mid-join. Exclude it from the join
 	// search, which pushes them to another live instance if one exists or forces a
-	// fresh one below. (Only the public path reuses instances, so only it needs the
-	// read; a private matchmake always gets a fresh instance.)
-	const currentInstanceId = privateInstance
-		? undefined
-		: (await getPresence<RoomInstance>(c.env.DB, ownerId))?.roomInstance?.roomInstanceId
+	// fresh one below. (Only the paths that reuse instances — public, and the shared
+	// session of an unpublished room — need the read; a private matchmake into a
+	// published room always gets a fresh instance.)
+	const reusesInstance = unpublished || !privateInstance
+	const currentInstanceId = reusesInstance
+		? (await getPresence<RoomInstance>(c.env.DB, ownerId))?.roomInstance?.roomInstanceId
+		: undefined
 	// The same build, with GAME_VERSION standing in for a token that names none. It scopes
 	// the search below and is stamped on the instance when one is created, which is what
 	// keeps a session to a single client version.
 	const gameVersion = tokenVersion ?? GAME_VERSION
-	// Reuse an existing joinable public instance *of the same subroom and the same
-	// build* — subrooms are separate places, so joining one must never land you in
-	// another, and neither must a session running a different version of the room.
-	// Private matchmakes always get a fresh instance. Create one when there's nothing
-	// to join.
-	let instance = privateInstance
-		? null
-		: await getJoinableInstance(c.env.DB, f.roomId, gameVersion, f.subRoomId, currentInstanceId)
+	// Reuse an existing joinable instance *of the same subroom and the same build* —
+	// subrooms are separate places, so joining one must never land you in another, and
+	// neither must a session running a different version of the room. A published room
+	// reuses a public instance; an unpublished one reuses its single private session.
+	// A private matchmake into a published room always gets a fresh instance. Create
+	// one when there's nothing to join.
+	let instance = unpublished
+		? await getSharedPrivateInstance(
+				c.env.DB,
+				f.roomId,
+				gameVersion,
+				f.subRoomId,
+				currentInstanceId
+			)
+		: privateInstance
+			? null
+			: await getJoinableInstance(c.env.DB, f.roomId, gameVersion, f.subRoomId, currentInstanceId)
 	if (!instance) {
 		instance = await createRoomInstance(c.env.DB, {
 			ownerAccountId: ownerId,
@@ -1566,7 +1584,9 @@ async function resolveRoomInstance(
  * {@link canEnterRoom}): a room that isn't published answers `RoomIsPrivate` (25) to anyone
  * but its creator, its role holders and its invitees, in either join mode — a private
  * instance of an unpublished room is still a way into it. Those it does admit always get
- * a PRIVATE instance of it, whatever `JoinMode` they posted.
+ * a PRIVATE instance of it, whatever `JoinMode` they posted — and the SAME one: an
+ * unpublished room has a single private instance per subroom and build, shared by
+ * everyone it admits (see `getSharedPrivateInstance`).
  *
  * `subRoomId` is optional: absent, `resolveRoomInstance` falls back to the room's first
  * subroom (its default entrance).

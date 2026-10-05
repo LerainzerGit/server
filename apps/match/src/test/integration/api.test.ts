@@ -1183,9 +1183,10 @@ describe('public endpoints', () => {
 				['8809', '20230414.01'],
 				['8810', '20221117'],
 			]) {
-				expect((await matchmake('/matchmake/room/2', player, version)).roomInstance).toMatchObject(
-					{ roomId: 2, name: '^RecCenter' }
-				)
+				expect((await matchmake('/matchmake/room/2', player, version)).roomInstance).toMatchObject({
+					roomId: 2,
+					name: '^RecCenter',
+				})
 			}
 			expect((await matchmake('/matchmake/room/2', '8811', '')).roomInstance).toMatchObject({
 				roomId: 2,
@@ -1279,9 +1280,16 @@ describe('auth-gated endpoints', () => {
 		expect(b.roomInstance.photonRoomId).toBe(a.roomInstance.photonRoomId)
 		expect(b.roomInstance.roomInstanceId).toBe(a.roomInstance.roomInstanceId)
 
-		// A private matchmake (JoinMode 2) gets its own distinct instance.
+		// A private matchmake (JoinMode 2) gets its own distinct instance — and so does the
+		// next one: a PUBLISHED room may have any number of private instances. Only an
+		// unpublished room collapses them into one shared session (see the accessibility
+		// tests below).
 		const priv = await matchmake('902', '2')
 		expect(priv.roomInstance.photonRoomId).not.toBe(a.roomInstance.photonRoomId)
+		const priv2 = await matchmake('903', '2')
+		expect(priv2.roomInstance.photonRoomId).not.toBe(a.roomInstance.photonRoomId)
+		expect(priv2.roomInstance.photonRoomId).not.toBe(priv.roomInstance.photonRoomId)
+		expect(priv2.roomInstance.roomInstanceId).not.toBe(priv.roomInstance.roomInstanceId)
 	})
 
 	test('POST /matchmake/room/:roomId only pools players on the same client build', async () => {
@@ -3049,7 +3057,11 @@ describe('auth-gated endpoints', () => {
 		expect((await v2('/matchmake/v2/room/2', '9880', 2)).RoomInstance?.RoomId).toBe(2)
 	})
 
-	test('an unpublished room’s instances are always PRIVATE, whatever JoinMode asked for', async () => {
+	test('an unpublished room has ONE private instance, shared by everyone it admits', async () => {
+		// Start clean: an earlier case may have left room 6 sessions and presence behind,
+		// and which instance a matchmake lands in is the whole point here.
+		await env.DB.prepare('DELETE FROM room_instance WHERE room_id = 6').run()
+		await env.DB.prepare('DELETE FROM presence WHERE account_id IN (42, 44, 9880, 9885)').run()
 		type V2 = {
 			ErrorCode: number
 			RoomInstance: { RoomInstanceId: number; RoomId: number; IsPrivate: boolean } | null
@@ -3076,7 +3088,10 @@ describe('auth-gated endpoints', () => {
 		expect(own.ErrorCode).toBe(0)
 		expect(own.RoomInstance).toMatchObject({ RoomId: 6, IsPrivate: true })
 		expect(await stored(own.RoomInstance?.RoomInstanceId)).toBe(1)
-		// The 2023 spelling, and JoinMode 1, are the same.
+		// The 2023 spelling, and JoinMode 1, are the same. The creator is already standing
+		// in the session above, and a matchmake never hands back the instance the caller is
+		// in (the client hangs on an unchanged id), so this one is a FRESH private session —
+		// and the first now sits empty, within the sweep's grace window.
 		const v1 = (await (
 			await exports.default.fetch(`${ORIGIN}/matchmake/room/6`, {
 				method: 'POST',
@@ -3086,17 +3101,55 @@ describe('auth-gated endpoints', () => {
 		).json()) as { roomInstance: { roomInstanceId: number; isPrivate: boolean } | null }
 		expect(v1.roomInstance?.isPrivate).toBe(true)
 		expect(await stored(v1.roomInstance?.roomInstanceId)).toBe(1)
+		expect(v1.roomInstance?.roomInstanceId).not.toBe(own.RoomInstance?.RoomInstanceId)
 
-		// Nothing public to reuse: a role holder asking for a public session gets a private
-		// one of their own rather than joining the creator's.
+		// A role holder joins the creator's session: an unpublished room has ONE private
+		// instance its people share, so a Host asking for a public session is placed WITH
+		// the creator — in the instance they're standing in, not the empty one they left,
+		// and never in a private instance of their own. Nothing public exists to reuse.
 		const host = await v2('/matchmake/v2/room/6', '44', 0)
 		expect(host.RoomInstance?.IsPrivate).toBe(true)
-		expect(host.RoomInstance?.RoomInstanceId).not.toBe(v1.roomInstance?.roomInstanceId)
+		expect(host.RoomInstance?.RoomInstanceId).toBe(v1.roomInstance?.roomInstanceId)
 		expect(
 			await env.DB.prepare(
 				'SELECT COUNT(*) AS n FROM room_instance WHERE room_id = 6 AND is_private = 0'
 			).first<{ n: number }>()
 		).toEqual({ n: 0 })
+
+		// JoinMode 2 does not fork an unpublished room either: an invitee asking for a
+		// private session is put in the same one, in both spellings of the route.
+		await env.DB.prepare(
+			'INSERT INTO room_invite (from_player_id, to_player_id, room_id, created_at) VALUES (42, 9880, 6, ?1)'
+		)
+			.bind(Math.floor(Date.now() / 1000))
+			.run()
+		try {
+			const invitee = await v2('/matchmake/v2/room/6/6', '9880', 2)
+			expect(invitee.RoomInstance?.RoomInstanceId).toBe(v1.roomInstance?.roomInstanceId)
+			// Standing in it now, so the 2023 spelling moves them to the only other
+			// session — the one the creator abandoned — rather than back into the same id.
+			const again = (await (
+				await exports.default.fetch(`${ORIGIN}/matchmake/room/6`, {
+					method: 'POST',
+					headers: {
+						...(await bearer('9880')),
+						'Content-Type': 'application/x-www-form-urlencoded',
+					},
+					body: 'JoinMode=2',
+				})
+			).json()) as { roomInstance: { roomInstanceId: number; isPrivate: boolean } | null }
+			expect(again.roomInstance?.isPrivate).toBe(true)
+			expect(again.roomInstance?.roomInstanceId).toBe(own.RoomInstance?.RoomInstanceId)
+			// Still exactly the two sessions: nothing was minted for anyone it admitted.
+			expect(
+				await env.DB.prepare('SELECT COUNT(*) AS n FROM room_instance WHERE room_id = 6').first<{
+					n: number
+				}>()
+			).toEqual({ n: 2 })
+		} finally {
+			await env.DB.prepare('DELETE FROM room_invite WHERE to_player_id = 9880').run()
+			await env.DB.prepare('DELETE FROM presence WHERE account_id = 9880').run()
+		}
 
 		// A FRIEND of the creator is not one of the room's people: neither follow gets them
 		// in — the 2023 route by the room's gate, the v2 route because the session is private.
@@ -3125,10 +3178,12 @@ describe('auth-gated endpoints', () => {
 			).toBeNull()
 
 			// One of the room's own people who is also a friend may follow: the room admits
-			// them itself. Here the creator follows the Host into the Host's session.
+			// them itself. Here the creator steps out to a public room, then follows the Host
+			// back into the shared session.
 			await env.DB.prepare(
 				'INSERT INTO relationship (requester_id, target_id, relationship_type) VALUES (42, 44, 3)'
 			).run()
+			expect((await v2('/matchmake/v2/room/2', '42', 0)).ErrorCode).toBe(0)
 			const ownFollow = (await (
 				await exports.default.fetch(`${ORIGIN}/matchmake/player/44`, {
 					method: 'POST',

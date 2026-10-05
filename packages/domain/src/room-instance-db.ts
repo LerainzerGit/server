@@ -433,6 +433,58 @@ export async function getJoinableInstance(
 }
 
 /**
+ * The ONE private session of an unpublished room — the instance of `subRoomId` running
+ * `gameVersion` that the room's people share — or null when nobody has opened one. The
+ * complement of {@link getJoinableInstance}: that search only ever reuses PUBLIC instances,
+ * and an unpublished room has none (every instance of it is private, see the match
+ * worker's `resolveRoomInstance`), so without this each of the room's people who
+ * matchmaked in got a private instance of their own and never found each other — a
+ * co-owner answering the creator's "come look at this" landed in an empty copy of the
+ * room beside them.
+ *
+ * Scoped like the public search: by subroom (separate places) and by build (a session
+ * belongs to one client version; another build's session reads as nothing to join and the
+ * caller opens one beside it). Full instances are skipped — there is nothing to put a
+ * player into — and `excludeInstanceId` drops the one the caller is already standing in,
+ * because the client keys its room transition off a CHANGING instance id and hangs when
+ * handed the same one back.
+ *
+ * That exclusion is also why the search prefers the instance with the most live players
+ * in it over the oldest: a creator re-entering the subroom they're in is moved to a fresh
+ * instance, and the one they left sits empty for the sweep's grace window. A co-owner
+ * arriving in the meantime must land with the creator, not in the abandoned shell.
+ */
+export async function getSharedPrivateInstance(
+	db: D1Database,
+	roomId: number,
+	gameVersion: string,
+	subRoomId: number,
+	excludeInstanceId?: number,
+	now = Math.floor(Date.now() / 1000)
+): Promise<RoomInstanceDto | null> {
+	const binds: Array<number | string> = [roomId, gameVersion, subRoomId, now]
+	let exclude = ''
+	if (excludeInstanceId !== undefined) {
+		binds.push(excludeInstanceId)
+		exclude = `AND id != ?${binds.length}`
+	}
+	const row = await db
+		.prepare(
+			`SELECT data FROM room_instance
+			 WHERE room_id = ?1 AND game_version = ?2 AND sub_room_id = ?3
+			   AND is_private = 1 AND is_full = 0 ${exclude}
+			 ORDER BY (
+			   SELECT COUNT(*) FROM presence
+			    WHERE presence.room_instance_id = room_instance.id AND presence.expires_at > ?4
+			 ) DESC, id
+			 LIMIT 1`
+		)
+		.bind(...binds)
+		.first<{ data: string }>()
+	return row ? toDto(parse(row.data)) : null
+}
+
+/**
  * All instances of a given room — every build's, unless `gameVersion` scopes it to the
  * sessions running one. An instance belongs to a single client build (see
  * {@link getJoinableInstance}), so a caller looking for one to place a player in wants
