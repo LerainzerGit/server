@@ -44,6 +44,7 @@ import {
 	DEFAULT_STARTING_TOKENS,
 	ensureStartingBalances,
 	getBalance,
+	payTokenGifts,
 	spendCurrency,
 } from '../../econ/src/balance-db'
 // The item catalog and the two inventories a skin or a consumable gift writes, all `econ`'s.
@@ -71,6 +72,7 @@ import type {
 	ModerationKickPayload,
 	PlayerProgressionLevelPayload,
 } from '../../notify/src/notification-payloads'
+import type { PlayerNotification } from '../../notify/src/notifications-hub'
 import type { App, Env } from './context'
 
 /**
@@ -658,12 +660,11 @@ function staffGiftContent(fields: Partial<GiftContent>): GiftContent {
  * drops unknown ones, so it costs nothing if unread. Best-effort: the box is already stored,
  * and an offline player meets it on their next read of their gifts.
  */
-async function announceGift(
-	c: Context<App>,
-	playerId: number,
+/** The `GiftPackageReceivedImmediate` frame announcing a stored box — see {@link announceGift}. */
+function giftFrame(
 	giftId: number,
 	content: GiftContent
-): Promise<void> {
+): GiftPackagePayload & { CustomAvatarItemId?: string } {
 	const frame: GiftPackagePayload = {
 		Id: giftId,
 		FromPlayerId: content.FromPlayerId ?? COACH_ACCOUNT_ID,
@@ -682,13 +683,22 @@ async function announceGift(
 		PlatformsToSpawnOn: -1,
 		BalanceType: ALL_PLATFORMS,
 	}
+	return content.CustomAvatarItemId
+		? { ...frame, CustomAvatarItemId: content.CustomAvatarItemId }
+		: frame
+}
+
+async function announceGift(
+	c: Context<App>,
+	playerId: number,
+	giftId: number,
+	content: GiftContent
+): Promise<void> {
 	try {
 		await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayer(
 			playerId,
 			NotificationType.GiftPackageReceivedImmediate,
-			content.CustomAvatarItemId
-				? { ...frame, CustomAvatarItemId: content.CustomAvatarItemId }
-				: { ...frame }
+			{ ...giftFrame(giftId, content) }
 		)
 	} catch (err) {
 		logger.error('failed to announce a staff gift', {
@@ -853,6 +863,74 @@ async function sendTokens(
 }
 
 /**
+ * {@link sendTokens} for a crowd — the room gift, the online drop and the role drop, which
+ * pay the same amount in the same box to everyone on a list. The one-player path is five
+ * D1 round trips and two hub calls; done in series for a full server that was a request of
+ * ~1,750 subrequests, a minute or more long, and past D1's 1,000-queries-an-invocation cap
+ * somewhere around 200 players — the drop then died partway, with the first players paid
+ * and the rest not, and no audit row. This banks the boxes through econ's batched
+ * `payTokenGifts` and announces the lot in ONE hub RPC.
+ *
+ * Per player it is exactly the one-player gift: the signup grant seeded first, the balance
+ * moved, a box stored, then a balance frame (the RESULTING total, into the -2 bucket) and
+ * the box announced. A negative amount is a debit guarded per row — `amount >= ?` in the
+ * UPDATE, so nobody is overdrawn — and a player who can't afford it is SKIPPED (no box, no
+ * frame) rather than failing the rest, as the one-player gift returns null. `paid` and
+ * `skipped` keep the order of `playerIds`.
+ *
+ * The frames are best-effort, as everywhere: the tokens and boxes are stored before the hub
+ * is called, and a player who was offline meets both on their next sign-in.
+ */
+async function sendTokensToMany(
+	c: Context<App>,
+	playerIds: readonly number[],
+	amount: number,
+	startingTokens: number,
+	message: string = STAFF_GIFT_MESSAGE
+): Promise<{ paid: number[]; skipped: number[] }> {
+	const content = staffGiftContent({
+		CurrencyType: CurrencyType.RecCenterTokens,
+		Currency: amount,
+		Message: message,
+	})
+	const { paid, skipped } = await payTokenGifts(
+		c.env.DB,
+		playerIds.map((accountId) => ({ accountId, amount, content })),
+		startingTokens
+	)
+
+	// The balance first, so the box's announcement lands on a total that already includes
+	// it — the same two frames, in the same order, as sendTokens.
+	const frames: PlayerNotification[] = paid.flatMap((p) => [
+		{
+			playerId: p.accountId,
+			notificationType: NotificationType.StorefrontBalanceUpdate,
+			data: {
+				Balance: p.balance,
+				CurrencyType: CurrencyType.RecCenterTokens,
+				Platform: ALL_PLATFORMS,
+			} satisfies BalanceResponsePayload,
+		},
+		{
+			playerId: p.accountId,
+			notificationType: NotificationType.GiftPackageReceivedImmediate,
+			data: { ...giftFrame(p.giftId, p.content) },
+		},
+	])
+	if (frames.length > 0) {
+		try {
+			await c.env.RECFLARE_NOTIFICATIONS_HUB.getByName(HUB_INSTANCE).notifyPlayers(frames)
+		} catch (err) {
+			logger.error('failed to announce a bulk staff token gift', {
+				paidCount: paid.length,
+				error: err instanceof Error ? err.message : String(err),
+			})
+		}
+	}
+	return { paid: paid.map((p) => p.accountId), skipped }
+}
+
+/**
  * Send tokens to EVERYONE standing in a room right now — every instance of it at once.
  *
  * The room is the audience, not one session: `getPlayerIdsInRoom` is the live, unexpired
@@ -861,10 +939,9 @@ async function sendTokens(
  * has lapsed is already gone from it.
  *
  * Each player is paid exactly as the one-player gift pays them — the same box, with the same
- * optional `message` on it — one after another rather than at once: this is a handful of writes per player, and a busy room would otherwise open a
- * hundred at a time. A player a negative amount can't be taken from is SKIPPED rather than
- * failing the room — the ones who could afford it have already been debited by then — and the
- * response says who was missed.
+ * optional `message` on it — in batches, through {@link sendTokensToMany}. A player a
+ * negative amount can't be taken from is SKIPPED rather than failing the room — the ones who
+ * could afford it are debited regardless — and the response says who was missed.
  */
 export async function giftRoomTokensHandler(c: Context<App>) {
 	const roomId = Number(c.req.param('roomId'))
@@ -885,13 +962,7 @@ export async function giftRoomTokensHandler(c: Context<App>) {
 	}
 
 	const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
-	const paid: number[] = []
-	const skipped: number[] = []
-	for (const playerId of playerIds) {
-		const sent = await sendTokens(c, playerId, amount, startingTokens, message)
-		if (sent === null) skipped.push(playerId)
-		else paid.push(playerId)
-	}
+	const { paid, skipped } = await sendTokensToMany(c, playerIds, amount, startingTokens, message)
 
 	await recordPlayerAudit(c, 'gift_tokens_room', { roomId, amount, message, paid, skipped })
 	logger.info('staff gifted tokens to a room', {
@@ -911,8 +982,9 @@ export async function giftRoomTokensHandler(c: Context<App>) {
  * The audience is every unexpired `presence` row, lobby included (see `getOnlinePlayerIds`),
  * read when the button is pressed: the same population the coach broadcast reaches and the
  * status page counts. Each player is paid exactly as the one-player and room gifts pay them
- * (banked, then a balance frame and an announced box), one after another for the same reason
- * the room gift is — a full server is a lot of writes, and they should not all open at once.
+ * (banked, then a balance frame and an announced box), in batches through
+ * {@link sendTokensToMany}: a full server is a lot of writes, and paid one player at a time
+ * the drop outran D1's per-invocation query cap and died partway.
  *
  * Narrower than the other gifts on purpose: the amount is POSITIVE and capped at
  * {@link MAX_TOKEN_DROP} per player, whatever `MAX_TOKEN_GIFT` says — a stray zero here is
@@ -943,13 +1015,8 @@ export async function giftOnlineTokensHandler(c: Context<App>) {
 	if (playerIds.length === 0) return c.json({ error: 'Nobody is online right now' }, 404)
 
 	const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
-	const paid: number[] = []
-	for (const playerId of playerIds) {
-		// A positive amount never comes back null: nothing to skip.
-		if ((await sendTokens(c, playerId, amount, startingTokens, message)) !== null) {
-			paid.push(playerId)
-		}
-	}
+	// A positive amount skips nobody.
+	const { paid } = await sendTokensToMany(c, playerIds, amount, startingTokens, message)
 
 	await recordPlayerAudit(c, 'gift_tokens_online', { amount, message, paid })
 	logger.info('staff dropped tokens on everyone online', {
@@ -1015,13 +1082,8 @@ export async function giftRoleTokensHandler(c: Context<App>) {
 	}
 
 	const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
-	const paid: number[] = []
-	for (const playerId of playerIds) {
-		// A positive amount never comes back null: nothing to skip.
-		if ((await sendTokens(c, playerId, amount, startingTokens, message)) !== null) {
-			paid.push(playerId)
-		}
-	}
+	// A positive amount skips nobody.
+	const { paid } = await sendTokensToMany(c, playerIds, amount, startingTokens, message)
 
 	await recordPlayerAudit(c, 'gift_tokens_role', { roleId, amount, message, paid })
 	logger.info('staff dropped tokens on a discord role', {

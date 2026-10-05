@@ -7670,6 +7670,49 @@ describe('discord role gift', () => {
 		])
 	})
 
+	// One box per ACCOUNT, not per link: a player who linked two Discord identities is paid
+	// once, the best role across both. And more accounts than one round pays (30) are all
+	// paid once, each with their own box, with two frames apiece in link order.
+	test('pays an account with two links once, and more accounts than one round holds', async () => {
+		const many = Array.from({ length: 40 }, (_, i) => 9400 + i)
+		await onlyDiscordLinks([
+			[9341, '900000000000000341', [ROLE_A]],
+			[9341, '900000000000000342', [ROLE_B]],
+			...many.map((id): [number, string, string[]] => [id, `9000000000000${id}`, [ROLE_A]]),
+		])
+		await drainFrames()
+
+		const summary = await grantDiscordRoleGifts(giftEnv(MAP), DEFAULT_STARTING_TOKENS)
+		expect(summary).toEqual({
+			skipped: false,
+			roles: 2,
+			links: 42,
+			granted: 41,
+			tokens: 10000 + 40 * 2500,
+			failed: 0,
+		})
+		expect(await tokens(9341)).toBe(DEFAULT_STARTING_TOKENS + 10000)
+		expect(await getPendingGifts(env.DB, 9341)).toMatchObject([{ Currency: 10000 }])
+
+		const frames = await drainFrames()
+		expect(frames.map((f) => f.accountId)).toEqual([9341, 9341, ...many.flatMap((id) => [id, id])])
+		const boxIds = new Set<number>()
+		for (const id of many) {
+			expect(await tokens(id)).toBe(DEFAULT_STARTING_TOKENS + 2500)
+			const boxes = await getPendingGifts(env.DB, id)
+			expect(boxes).toHaveLength(1)
+			boxIds.add(boxes[0]!.Id)
+			const own = frames.filter((f) => f.accountId === id)
+			expect(own[0]!.payload).toEqual({
+				Balance: DEFAULT_STARTING_TOKENS + 2500,
+				CurrencyType: CurrencyType.RecCenterTokens,
+				Platform: -2,
+			})
+			expect(own[1]!.payload).toMatchObject({ Id: boxes[0]!.Id, Currency: 2500 })
+		}
+		expect(boxIds.size).toBe(many.length)
+	})
+
 	test('every run pays again — the schedule is the cadence — and a lapsed role is not paid', async () => {
 		await onlyDiscordLinks([
 			[9321, '900000000000000321', [ROLE_A]],

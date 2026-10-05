@@ -52,7 +52,9 @@ import {
 	BALANCE_SCHEMA_DDL,
 	CurrencyType,
 	DEFAULT_STARTING_TOKENS,
+	ensureStartingBalances,
 	getBalance,
+	spendCurrency,
 } from '../../../../econ/src/balance-db'
 import { CATALOG_SCHEMA_DDL } from '../../../../econ/src/catalog-db'
 import { CONSUMABLE_SCHEMA_DDL, getConsumables } from '../../../../econ/src/consumables-db'
@@ -1770,6 +1772,7 @@ it('drops tokens on everyone online, lobby included, with the message on the box
 		`UPDATE presence SET data = json_set(data, '$.expiresAt', 1) WHERE account_id = 8383`
 	).run()
 
+	await clearHub()
 	const res = await devPost('/api/staff/online/gift-tokens', 8110, {
 		amount: 100,
 		message: 'Thanks for playing!',
@@ -1781,6 +1784,7 @@ it('drops tokens on everyone online, lobby included, with the message on the box
 	expect(body.paid).toEqual(expect.arrayContaining([8380, 8381, 8382]))
 	expect(body.paid).not.toContain(8383)
 
+	const frames = await hubFrames()
 	for (const playerId of [8380, 8381, 8382]) {
 		await expect(
 			getBalance(env.DB, playerId, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
@@ -1788,7 +1792,23 @@ it('drops tokens on everyone online, lobby included, with the message on the box
 		const gifts = await getPendingGifts(env.DB, playerId)
 		expect(gifts).toHaveLength(1)
 		expect(gifts[0]).toMatchObject({ Currency: 100, Message: 'Thanks for playing!' })
+		// The same two frames the one-player gift sends, in the same order: the resulting
+		// total into the -2 bucket, then the box it came in — every player's own.
+		const own = frames.filter((f) => f.playerId === playerId)
+		expect(own.map((f) => f.notificationType)).toEqual([61, 31])
+		expect(own[0].data).toEqual({
+			Balance: DEFAULT_STARTING_TOKENS + 100,
+			CurrencyType: CurrencyType.RecCenterTokens,
+			Platform: -2,
+		})
+		expect(own[1].data).toMatchObject({
+			Id: gifts[0]!.Id,
+			Currency: 100,
+			Message: 'Thanks for playing!',
+			BalanceType: -2,
+		})
 	}
+	expect(frames.filter((f) => f.playerId === 8383)).toEqual([])
 	expect(await getPendingGifts(env.DB, 8383)).toEqual([])
 
 	const { results } = await env.DB.prepare(
@@ -1811,6 +1831,115 @@ it('refuses a token drop over the cap, without a message, or with nobody online'
 	// An empty server is a 404 rather than a silent success, as an empty room is.
 	await env.DB.prepare('DELETE FROM presence').run()
 	expect((await drop({ amount: 1_000, message: 'hi' })).status).toBe(404)
+})
+
+// The drop pays in rounds of 30 (three bound values a player, 100 a statement) and announces
+// the lot in one hub call. More players than one round holds, with a balance row already
+// present for some and none for the rest: everyone is paid once, in presence order, each
+// box has its own id, and the hub gets exactly two frames a player — nobody doubled by a
+// round boundary and nobody dropped past it.
+it('drops tokens on more players than one round pays, each exactly once', async () => {
+	await env.DB.prepare('DELETE FROM presence').run()
+	const players = Array.from({ length: 70 }, (_, i) => 8600 + i)
+	for (const accountId of players) {
+		await setPresence(env.DB, {
+			accountId,
+			roomInstance: null,
+			statusVisibility: 0,
+			deviceClass: 0,
+			vrMovementMode: 0,
+			platform: 4,
+			appVersion: 'test',
+		})
+	}
+	// Half already hold a balance row (one touched by a prior read); the rest get the signup
+	// grant seeded by the drop itself. Both must land on grant + drop.
+	for (const accountId of players.filter((id) => id % 2 === 0)) {
+		await getBalance(env.DB, accountId, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+	}
+
+	await clearHub()
+	const res = await devPost('/api/staff/online/gift-tokens', 8110, {
+		amount: 7,
+		message: 'Round and round',
+	})
+	expect(res.status).toBe(200)
+	const body = (await res.json()) as { paid: number[] }
+	expect(body.paid).toEqual(players)
+
+	const { results } = await env.DB.prepare(
+		`SELECT account_id AS accountId, amount FROM balance
+		 WHERE currency_type = ?1 AND account_id BETWEEN 8600 AND 8669 ORDER BY account_id`
+	)
+		.bind(CurrencyType.RecCenterTokens)
+		.all<{ accountId: number; amount: number }>()
+	expect(results.map((r) => r.accountId)).toEqual(players)
+	expect(new Set(results.map((r) => r.amount))).toEqual(new Set([DEFAULT_STARTING_TOKENS + 7]))
+
+	const frames = await hubFrames()
+	expect(frames).toHaveLength(players.length * 2)
+	const boxIds = new Set<number>()
+	for (const playerId of players) {
+		const own = frames.filter((f) => f.playerId === playerId)
+		expect(own.map((f) => f.notificationType)).toEqual([61, 31])
+		expect(own[0].data.Balance).toBe(DEFAULT_STARTING_TOKENS + 7)
+		const gifts = await getPendingGifts(env.DB, playerId)
+		expect(gifts).toHaveLength(1)
+		expect(own[1].data.Id).toBe(gifts[0]!.Id)
+		boxIds.add(gifts[0]!.Id)
+	}
+	expect(boxIds.size).toBe(players.length)
+})
+
+// A negative room gift is a debit guarded per player: whoever can't cover it is skipped —
+// no debit, no box, no frame — and the ones who can are still charged.
+it('skips the players a room debit would overdraw, and charges the rest', async () => {
+	const inRoom = async (accountId: number) =>
+		setPresence(env.DB, {
+			accountId,
+			roomInstance: { roomId: 7730, roomInstanceId: 77301 },
+			statusVisibility: 0,
+			deviceClass: 0,
+			vrMovementMode: 0,
+			platform: 4,
+			appVersion: 'test',
+		})
+	await inRoom(8480)
+	await inRoom(8481)
+	await inRoom(8482)
+	// 8481 has already spent most of their grant.
+	await ensureStartingBalances(env.DB, 8481, DEFAULT_STARTING_TOKENS)
+	expect(
+		await spendCurrency(
+			env.DB,
+			8481,
+			CurrencyType.RecCenterTokens,
+			DEFAULT_STARTING_TOKENS - 10,
+			DEFAULT_STARTING_TOKENS
+		)
+	).toBe(true)
+
+	await clearHub()
+	const res = await devPost('/api/staff/rooms/7730/gift-tokens', 8110, { amount: -100 })
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({
+		roomId: 7730,
+		amount: -100,
+		paid: [8480, 8482],
+		skipped: [8481],
+	})
+	for (const playerId of [8480, 8482]) {
+		await expect(
+			getBalance(env.DB, playerId, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+		).resolves.toBe(DEFAULT_STARTING_TOKENS - 100)
+		expect(await getPendingGifts(env.DB, playerId)).toHaveLength(1)
+	}
+	await expect(
+		getBalance(env.DB, 8481, CurrencyType.RecCenterTokens, DEFAULT_STARTING_TOKENS)
+	).resolves.toBe(10)
+	expect(await getPendingGifts(env.DB, 8481)).toEqual([])
+	const frames = await hubFrames()
+	expect(frames.map((f) => f.playerId)).toEqual([8480, 8480, 8482, 8482])
 })
 
 // The role drop's audience is the Discord links that record the role — offline included,
