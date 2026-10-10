@@ -1556,3 +1556,45 @@ export async function grantPlusHandler(c: Context<App>) {
 	logger.info('staff granted plus', { moderatorId: staffId(c), playerId, hadPlus })
 	return c.json({ playerId, hasPlus: true, hadPlus })
 }
+
+/**
+ * Whether the acting staff member's OWN account is a sandbox account — the `isSandbox`
+ * flag `match` reads on every `GET /player/connection-info` to pick the sandbox Tachyon
+ * pool over the live one. Self-only: the toggle on the account page is how a moderator or
+ * developer moves THEMSELVES onto the test servers, not how anyone is moved by someone else
+ * (an operator does that with `runx admin`, if at all).
+ */
+export async function sandboxStatusHandler(c: Context<App>) {
+	const account = await getAccount(c.env.DB, staffId(c))
+	return c.json({ sandbox: account?.isSandbox === true })
+}
+
+/**
+ * Opt the acting staff member in to or out of the sandbox pool: `{ sandbox: boolean }` sets
+ * `isSandbox` on their own account. Idempotent — setting what's already set succeeds,
+ * changes nothing and still answers the current state. Logged on `audit_log` like every
+ * other account change staff make from the website, with `changed` saying whether anything
+ * moved.
+ *
+ * `match` reads the account per connection-info request, so the switch is honoured the next
+ * time the player joins a room instance; the instance they're standing in keeps its server.
+ */
+export async function setSandboxHandler(c: Context<App>) {
+	const body = (await c.req.json().catch(() => null)) as { sandbox?: unknown } | null
+	if (body === null || typeof body !== 'object' || typeof body.sandbox !== 'boolean') {
+		return c.json({ error: 'Expected a JSON body with a boolean `sandbox`' }, 400)
+	}
+	const playerId = staffId(c)
+	const account = await getAccount(c.env.DB, playerId)
+	const was = account?.isSandbox === true
+	const changed = was !== body.sandbox
+	if (changed) await updateAccount(c.env.DB, playerId, { isSandbox: body.sandbox })
+
+	await recordPlayerAudit(c, 'set_sandbox', { playerId, sandbox: body.sandbox, changed })
+	logger.info('staff set their sandbox flag', {
+		moderatorId: playerId,
+		sandbox: body.sandbox,
+		changed,
+	})
+	return c.json({ sandbox: body.sandbox, changed })
+}

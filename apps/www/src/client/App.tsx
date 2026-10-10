@@ -3804,6 +3804,8 @@ function Dashboard({
 			? [
 					{ id: 'maintenance', label: 'Server maintenance', render: () => <MaintenanceForm /> },
 					{ id: 'coach', label: 'Coach message', render: () => <CoachMessageForm /> },
+					// The staff member's OWN voice-server pool, not a thing done to anyone else.
+					{ id: 'sandbox', label: 'Sandbox', render: () => <SandboxForm /> },
 				]
 			: []),
 		// Narrower than the two above: the drop mints tokens, and www's route is developer-only.
@@ -4116,6 +4118,69 @@ function MaintenanceForm() {
 					{pending ? 'Broadcasting…' : 'Broadcast maintenance'}
 				</button>
 			</form>
+		</section>
+	)
+}
+
+/**
+ * Staff only: opt the signed-in account in to or out of the SANDBOX — the separate Tachyon
+ * (voice) server pool `match` hands a sandbox account on every connection-info read. It is
+ * the account's `isSandbox` flag, and www's route only ever sets the caller's own, so this
+ * lives on the account page rather than the staff card on a profile. The current state is
+ * read on mount; one button flips it. `match` reads the flag per room join, so the switch
+ * lands the next time they join a room, not in the instance they are standing in.
+ */
+function SandboxForm() {
+	// undefined = not fetched yet.
+	const [sandbox, setSandbox] = useState<boolean | undefined>(undefined)
+	const [loadError, setLoadError] = useState('')
+	const { pending, error, done, run } = useAction()
+
+	useEffect(() => {
+		void call<{ sandbox: boolean }>('/api/staff/sandbox', { authed: true })
+			.then((res) => setSandbox(res.sandbox))
+			.catch((e) => setLoadError(e instanceof Error ? e.message : String(e)))
+	}, [])
+
+	return (
+		<section className="card">
+			<h2>Sandbox</h2>
+			<p className="muted">
+				A sandbox account is put on the sandbox voice servers instead of the live ones, for testing
+				a Tachyon build before players get it. This only changes your own account. It takes effect
+				the next time you join a room.
+			</p>
+			{loadError && <p className="error">{loadError}</p>}
+			{sandbox === undefined && !loadError ? (
+				<p className="muted">Loading…</p>
+			) : sandbox !== undefined ? (
+				<>
+					<p>
+						You are currently {sandbox ? <strong>in</strong> : <strong>out of</strong>} the sandbox.
+					</p>
+					{error && <p className="error">{error}</p>}
+					{done && <p className="ok">{done}</p>}
+					<button
+						type="button"
+						disabled={pending}
+						onClick={() =>
+							void run(async () => {
+								const next = !sandbox
+								const res = await call<{ sandbox: boolean; changed: boolean }>(
+									'/api/staff/sandbox',
+									{ authed: true, method: 'PUT', json: { sandbox: next } }
+								)
+								setSandbox(res.sandbox)
+								return res.sandbox
+									? 'You are in the sandbox. Join a room to land on the sandbox servers.'
+									: 'You are out of the sandbox. Join a room to land back on the live servers.'
+							})
+						}
+					>
+						{pending ? 'Saving…' : sandbox ? 'Leave sandbox' : 'Join sandbox'}
+					</button>
+				</>
+			) : null}
 		</section>
 	)
 }

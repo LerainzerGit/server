@@ -863,6 +863,7 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		'/api/staff/players/1',
 		'/api/staff/players/1/linked',
 		'/api/staff/studio-access',
+		'/api/staff/sandbox',
 	]
 	const writes = [
 		'/api/staff/players/1/gift-tokens',
@@ -934,6 +935,22 @@ it('refuses every staff endpoint without a token, and without a staff role', asy
 		headers: { authorization: `Bearer ${await tokenFor(8101, ['gameClient'])}` },
 	})
 	expect(playerRemove.status).toBe(403)
+	// The sandbox toggle is a PUT, so the loop over POSTs above doesn't cover it.
+	const sandboxUnauthed = await SELF.fetch('https://example.com/api/staff/sandbox', {
+		method: 'PUT',
+		headers: { 'content-type': 'application/json' },
+		body: JSON.stringify({ sandbox: true }),
+	})
+	expect(sandboxUnauthed.status).toBe(401)
+	const sandboxPlayer = await SELF.fetch('https://example.com/api/staff/sandbox', {
+		method: 'PUT',
+		headers: {
+			authorization: `Bearer ${await tokenFor(8101, ['gameClient'])}`,
+			'content-type': 'application/json',
+		},
+		body: JSON.stringify({ sandbox: true }),
+	})
+	expect(sandboxPlayer.status).toBe(403)
 })
 
 // The reporter is the CALLER, never a body field — that is the record of who raised a
@@ -2963,5 +2980,64 @@ it('lets staff add, list, and remove studio upload access', async () => {
 	expect(await auditRows('revoke_studio_access', 8601)).toEqual([
 		{ actor: 8110, data: { playerId: 8601, username: 'StudioFan', removed: true } },
 		{ actor: 8110, data: { playerId: 8601, username: 'StudioFan', removed: false } },
+	])
+})
+
+// ---- Sandbox opt-in ---------------------------------------------------------
+// `match` picks the Tachyon pool off the account's `isSandbox` flag. Staff flip their OWN
+// flag from the account page; the route never takes a player id, so nobody can be moved by
+// someone else here.
+
+it('lets staff opt themselves in and out of the sandbox pool, and only themselves', async () => {
+	await updateAccount(env.DB, 8120, { username: 'SandboxMod' })
+
+	const staffPut = (accountId: number, body: unknown, roles = ['moderator']) =>
+		tokenFor(accountId, roles).then((token) =>
+			SELF.fetch('https://example.com/api/staff/sandbox', {
+				method: 'PUT',
+				headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' },
+				body: JSON.stringify(body),
+			})
+		)
+
+	// Off until opted in, for a moderator and a developer alike.
+	let res = await staffGet('/api/staff/sandbox', 8120)
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({ sandbox: false })
+	expect((await staffGet('/api/staff/sandbox', 8120, ['developer'])).status).toBe(200)
+
+	// Not a boolean, not a body.
+	expect((await staffPut(8120, { sandbox: 'yes' })).status).toBe(400)
+	expect((await staffPut(8120, {})).status).toBe(400)
+
+	res = await staffPut(8120, { sandbox: true })
+	expect(res.status).toBe(200)
+	expect(await res.json()).toEqual({ sandbox: true, changed: true })
+	expect((await getAccount(env.DB, 8120))?.isSandbox).toBe(true)
+	expect(await (await staffGet('/api/staff/sandbox', 8120)).json()).toEqual({ sandbox: true })
+
+	// Idempotent: opting in again changes nothing and says so.
+	res = await staffPut(8120, { sandbox: true })
+	expect(await res.json()).toEqual({ sandbox: true, changed: false })
+
+	// A developer's token works the same, and the flag is theirs, not the moderator's.
+	res = await staffPut(8121, { sandbox: true }, ['developer'])
+	expect(await res.json()).toEqual({ sandbox: true, changed: true })
+	expect((await getAccount(env.DB, 8121))?.isSandbox).toBe(true)
+
+	res = await staffPut(8120, { sandbox: false })
+	expect(await res.json()).toEqual({ sandbox: false, changed: true })
+	expect((await getAccount(env.DB, 8120))?.isSandbox).toBe(false)
+	expect((await getAccount(env.DB, 8121))?.isSandbox).toBe(true)
+
+	// Each flip is on the audit log against the staff member who made it.
+	const rows = await env.DB.prepare(
+		"SELECT player_id, data FROM audit_log WHERE action = 'set_sandbox' ORDER BY audit_log_id"
+	).all<{ player_id: number; data: string }>()
+	expect(rows.results.map((r) => [r.player_id, JSON.parse(r.data).sandbox])).toEqual([
+		[8120, true],
+		[8120, true],
+		[8121, true],
+		[8120, false],
 	])
 })

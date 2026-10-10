@@ -58,7 +58,9 @@ import {
 	requireDeveloper,
 	requireStaff,
 	runDiscordRoleGiftHandler,
+	sandboxStatusHandler,
 	searchReportsHandler,
+	setSandboxHandler,
 	syncDiscordRolesHandler,
 	topReportedHandler,
 } from './staff'
@@ -583,6 +585,11 @@ const app = new Hono<App>()
 	.post('/api/staff/players/:id/grant-plus', requireDeveloper, grantPlusHandler)
 	.post('/api/staff/players/:id/username-changes', addUsernameChangeHandler)
 	.post('/api/staff/players/:id/clear-password', clearPasswordHandler)
+	// The signed-in staff member's OWN sandbox flag: read it, and opt in or out. Self-only,
+	// so plain staff (not developer-only) — it moves nobody but the caller, and `match`
+	// honours it on their next room join.
+	.get('/api/staff/sandbox', sandboxStatusHandler)
+	.put('/api/staff/sandbox', setSandboxHandler)
 	// RecFlare Studio upload access. The same staff gate as moderation: a moderator
 	// decides who can upload, and the role lands on the player's next token.
 	.get('/api/staff/studio-access', listStudioAccessHandler)
