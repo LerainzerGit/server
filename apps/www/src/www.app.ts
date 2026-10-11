@@ -57,7 +57,11 @@ import {
 	playerHistoryHandler,
 	requireDeveloper,
 	requireStaff,
+	runDiscordRoleGiftHandler,
+	sandboxStatusHandler,
 	searchReportsHandler,
+	setSandboxHandler,
+	syncDiscordRolesHandler,
 	topReportedHandler,
 } from './staff'
 import {
@@ -572,10 +576,20 @@ const app = new Hono<App>()
 	// Its sibling: the same gift to every account whose Discord link holds a role, offline
 	// included — the supporter cron's audience, with an operator's amount and message.
 	.post('/api/staff/discord-roles/:roleId/gift-tokens', requireDeveloper, giftRoleTokensHandler)
+	// The daily role sweep, run now and answered with its summary (halt reason included) —
+	// the cron reports only to a log line, and this is the way to see why it wrote nothing.
+	.post('/api/staff/discord-roles/sync', requireDeveloper, syncDiscordRolesHandler)
+	// Econ's weekly supporter gift, paid now: a bonus round for everyone holding a mapped role.
+	.post('/api/staff/discord-roles/supporter-gift', requireDeveloper, runDiscordRoleGiftHandler)
 	// Rec Room Plus is worth tokens and a discount, so granting it is developer-only too.
 	.post('/api/staff/players/:id/grant-plus', requireDeveloper, grantPlusHandler)
 	.post('/api/staff/players/:id/username-changes', addUsernameChangeHandler)
 	.post('/api/staff/players/:id/clear-password', clearPasswordHandler)
+	// The signed-in staff member's OWN sandbox flag: read it, and opt in or out. Self-only,
+	// so plain staff (not developer-only) — it moves nobody but the caller, and `match`
+	// honours it on their next room join.
+	.get('/api/staff/sandbox', sandboxStatusHandler)
+	.put('/api/staff/sandbox', setSandboxHandler)
 	// RecFlare Studio upload access. The same staff gate as moderation: a moderator
 	// decides who can upload, and the role lands on the player's next token.
 	.get('/api/staff/studio-access', listStudioAccessHandler)

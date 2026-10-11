@@ -54,6 +54,7 @@ export const SUPPORTED_GAME_VERSIONS: string[] = [
 	'20230616', // alpha
 	'20231207', // alpha
 	'20250424.01', // alpha
+	'20260323.14', // alpha
 ]
 
 /** Whether a client-supplied build (the version check's `?v=`) is one we serve. */
@@ -368,6 +369,25 @@ export async function getExpiredPresenceInstanceIds(
 			`SELECT DISTINCT room_instance_id AS id FROM presence
 			 WHERE expires_at <= ?1 AND room_instance_id IS NOT NULL`
 		)
+		.bind(now)
+		.all<{ id: number }>()
+	return results.map((r) => r.id)
+}
+
+/**
+ * The players whose presence rows have expired — the players about to be purged by
+ * {@link deleteExpiredPresence}. Read BEFORE the purge: once the rows are gone nothing
+ * remembers who lapsed, and their friends are owed the same offline
+ * SubscriptionUpdatePresence a logout sends (the lapse IS their logout, just one the
+ * client never got to post). Includes lobby (null-instance) presence — a player idle
+ * in the lobby who stops heartbeating has gone offline too.
+ */
+export async function getExpiredPresenceAccountIds(
+	db: D1Database,
+	now = nowSeconds()
+): Promise<number[]> {
+	const { results } = await db
+		.prepare('SELECT account_id AS id FROM presence WHERE expires_at <= ?1 ORDER BY account_id')
 		.bind(now)
 		.all<{ id: number }>()
 	return results.map((r) => r.id)

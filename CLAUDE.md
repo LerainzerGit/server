@@ -51,7 +51,7 @@ Supported client builds live in `SUPPORTED_GAME_VERSIONS`
 - `20230414` — default, official. Manifest `7859140924515540835` (2023).
 - `20250718.01` — beta, official. Manifest `1151455856673601091`; reaches this server via
   the [patch-2025](https://github.com/recflare/patch-2025) patch.
-- `20250424.01`, `20231207`, `20230616` — alpha.
+- `20260323.14`, `20250424.01`, `20231207`, `20230616` — alpha.
 
 Builds are date-stamped (`YYYYMMDD[.NN]`) so they order as plain strings; several
 surfaces gate on "newer than `20230414`" (econ storefront catalog, `api` event tags,
@@ -115,15 +115,24 @@ inconsistency here without checking the client first.
   `StagedSubRoomDataSaveId` carries no subroom context), and nothing is overwritten, so
   `…/saves` is real history and `publish_save` doubles as restore-a-save. There
   is no `GET …/subrooms/:sid/data`; only the POST (the room save) exists on that path.
-  `GET …/saves/:saveId` is the detail behind a list row, under the same gate, but in the
-  CAMELCASE projection the room save's response uses — not the PascalCase rows the list
-  serves. Three shapes of one save; keep them straight.
-- Both save reads (`rooms`: `…/saves` and `…/saves/:saveId`) are auth-gated and readable by
-  the room's CREATOR or by anyone whose live `presence` row puts them in that room — not by
-  co-owners as such (a co-owner passes only by standing there). They list unpublished
-  staged saves, so they aren't public; but a visitor resolves which version an instance is
-  running from this list, so creator-only locks them out of loading the room. The grant
-  expires with the presence row.
+  `GET …/saves/:saveId` is the detail behind a list row, under the same gate, and a
+  PASCALCASE row like the list serves — NOT the camelCase projection the room save's
+  response uses (served that, the client showed a save with every value missing). It
+  differs from the list row only in how it names bundles: each `UnitySubAssets` entry is
+  `{ UnityAssetId, UnityAsset, UnityAssetHash }`, the main bundle is lifted to top-level
+  `UnityAsset`/`UnityAssetHash`, and there is no `Tags`. Three shapes of one save; keep
+  them straight.
+- The save reads (`rooms`: `…/saves`, `…/saves/no_unity_assets` and `…/saves/:saveId`) are
+  auth-gated and readable by the room's creator, a CO-OWNER, anyone whose live `presence`
+  row puts them in that room, or STAFF (a `developer`/`moderator` token). They list
+  unpublished staged saves, so they aren't public; but a co-owner opens the save history from
+  the room's settings without being in the room (creator-only showed them the buttons and a
+  list that 403'd), and a visitor resolves which version an instance is running from this
+  list, so managers-only locks them out of loading the room. The presence grant expires with
+  the presence row. The client reads `…/saves/no_unity_assets` BEFORE it matchmakes a private
+  instance, when the caller has no presence in the room yet, so presence alone cannot let a
+  non-owner create one: a developer creating a private instance of a room they hold no role
+  on was 403'd there until staff were let through.
 - A room save writes ONLY to the subroom and its save row — never to the room. Everything
   the body carries describes that one revision: `Description` is the save comment shown in
   `…/saves`, and `PersistenceVersion`/`InventionUsage` describe the scene just saved (the

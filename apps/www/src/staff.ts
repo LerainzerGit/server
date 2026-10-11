@@ -55,11 +55,14 @@ import {
 	toCatalogSkin,
 } from '../../econ/src/catalog-db'
 import { countConsumable, grantConsumable } from '../../econ/src/consumables-db'
+import { grantDiscordRoleGifts } from '../../econ/src/discord-role-gift'
 import { getEquipment, grantEquipment } from '../../econ/src/equipment-db'
 import { grantCustomAvatarItem, ownedCustomAvatarItemIds } from '../../econ/src/inventory-custom-db'
 // The notification ids and the kick frame's recovered shape, owned by `notify`. Both are
 // imported as values/types with no runtime dependencies.
 import { NotificationType } from '../../notify/src/notification-types'
+// The sweep itself, so a developer can run it on demand instead of waiting for the cron.
+import { refreshDiscordRoles } from './discord-roles'
 
 import type { Context, MiddlewareHandler } from 'hono'
 import type { GiftContent } from '@repo/domain'
@@ -577,6 +580,13 @@ export const DEFAULT_MAX_XP_GIFT = 100
  */
 export const MAX_TOKEN_DROP = 1_000
 
+/**
+ * The most the Discord ROLE drop can carry per player. Higher than {@link MAX_TOKEN_DROP}:
+ * the audience is a named role, not whoever happens to be on, so the operator chooses who is
+ * paid and the drop is a reward rather than a server-wide thank-you.
+ */
+export const MAX_ROLE_TOKEN_DROP = 10_000
+
 /** The longest message a staff box may carry — the same cap a client message has. */
 const MAX_GIFT_MESSAGE = 256
 
@@ -1046,9 +1056,10 @@ export async function giftOnlineTokensHandler(c: Context<App>) {
  * their next read, as they do for every box the server hands over.
  *
  * The role is a Discord snowflake — all digits, compared exactly, as the sweep stores them.
- * The amount is bounded as the online drop's is ({@link MAX_TOKEN_DROP} each, positive only):
- * this one multiplies by a role's whole membership, which can be larger than the server has
- * ever had online at once. The message is required for the same reason.
+ * The amount is bounded as the online drop's is, positive only, but with its own cap
+ * ({@link MAX_ROLE_TOKEN_DROP} each): this one multiplies by a role's whole membership, which
+ * can be larger than the server has ever had online at once. The message is required for the
+ * same reason.
  */
 export async function giftRoleTokensHandler(c: Context<App>) {
 	const roleId = c.req.param('roleId') ?? ''
@@ -1061,9 +1072,11 @@ export async function giftRoleTokensHandler(c: Context<App>) {
 	if (!Number.isInteger(amount) || amount <= 0) {
 		return c.json({ error: 'Enter a whole number of tokens greater than 0' }, 400)
 	}
-	if (amount > MAX_TOKEN_DROP) {
+	if (amount > MAX_ROLE_TOKEN_DROP) {
 		return c.json(
-			{ error: `A token drop can carry at most ${MAX_TOKEN_DROP.toLocaleString()} tokens each` },
+			{
+				error: `A token drop can carry at most ${MAX_ROLE_TOKEN_DROP.toLocaleString()} tokens each`,
+			},
 			400
 		)
 	}
@@ -1093,6 +1106,54 @@ export async function giftRoleTokensHandler(c: Context<App>) {
 		paidCount: paid.length,
 	})
 	return c.json({ roleId, amount, message, paid })
+}
+
+/**
+ * Run the Discord role sweep NOW — the daily cron (discord-roles.ts) on a button, for a
+ * developer who has just changed the bot, invited it to the guild, or needs the role drop
+ * above to see this morning's roles. Same code, same credentials, same writes: every Discord
+ * link is re-read through the bot token and `platform_account.role` rewritten.
+ *
+ * The point of having it as a request is the ANSWER. The cron's summary goes to a log line
+ * on a worker with observability off, so a sweep that halts on its first call (a token
+ * Discord refuses, a bot not in the guild) halts silently every night, and the table looks
+ * exactly as it did — which is how it was found never to have completed a run. Here the
+ * same summary comes back as the response, `halted` reason and all.
+ *
+ * Always a 200 with the summary, whatever it says: a `skipped` or `halted` run is not a
+ * malformed request, it is the sweep reporting on its configuration, and the operator
+ * reads the reason off the body. Two developers pressing it at once run two sweeps that
+ * interleave harmlessly — each write is the absolute role list Discord served — at twice the
+ * Discord calls; nothing locks it. It is on the audit log like any other developer action.
+ */
+export async function syncDiscordRolesHandler(c: Context<App>) {
+	const summary = await refreshDiscordRoles(c.env)
+	await recordPlayerAudit(c, 'sync_discord_roles', { ...summary })
+	logger.info('staff ran the discord role sweep', { moderatorId: staffId(c), ...summary })
+	return c.json(summary)
+}
+
+/**
+ * Run econ's supporter gift NOW — the weekly cron (econ's discord-role-gift.ts) on a button,
+ * a bonus round for a developer who wants every supporter paid again today. Same function,
+ * same map (`DISCORD_ROLE_TOKENS`), same box: every account whose Discord link holds a mapped
+ * role is boxed its best role's tokens, online or not. The role drop above is the same
+ * audience with an operator's amount and message; this one pays what the map says and
+ * says so on the box.
+ *
+ * It pays everyone it finds, every time — the gift keeps no ledger, and that module is
+ * explicit that a hand run is an extra gift on purpose. So the panel asks before sending,
+ * and the run is on the audit log with how many boxes and tokens went out.
+ *
+ * Always a 200 with the run's summary, as the sweep's sync is: a `skipped` run (no role
+ * mapped) is the gift reporting on its configuration, and the panel shows the reason.
+ */
+export async function runDiscordRoleGiftHandler(c: Context<App>) {
+	const startingTokens = intVar(c.env.STARTING_TOKENS, DEFAULT_STARTING_TOKENS)
+	const summary = await grantDiscordRoleGifts(c.env, startingTokens)
+	await recordPlayerAudit(c, 'run_discord_role_gift', { ...summary })
+	logger.info('staff ran the discord supporter gift', { moderatorId: staffId(c), ...summary })
+	return c.json(summary)
 }
 
 /**
@@ -1494,4 +1555,46 @@ export async function grantPlusHandler(c: Context<App>) {
 	await recordPlayerAudit(c, 'grant_plus', { playerId, hadPlus })
 	logger.info('staff granted plus', { moderatorId: staffId(c), playerId, hadPlus })
 	return c.json({ playerId, hasPlus: true, hadPlus })
+}
+
+/**
+ * Whether the acting staff member's OWN account is a sandbox account — the `isSandbox`
+ * flag `match` reads on every `GET /player/connection-info` to pick the sandbox Tachyon
+ * pool over the live one. Self-only: the toggle on the account page is how a moderator or
+ * developer moves THEMSELVES onto the test servers, not how anyone is moved by someone else
+ * (an operator does that with `runx admin`, if at all).
+ */
+export async function sandboxStatusHandler(c: Context<App>) {
+	const account = await getAccount(c.env.DB, staffId(c))
+	return c.json({ sandbox: account?.isSandbox === true })
+}
+
+/**
+ * Opt the acting staff member in to or out of the sandbox pool: `{ sandbox: boolean }` sets
+ * `isSandbox` on their own account. Idempotent — setting what's already set succeeds,
+ * changes nothing and still answers the current state. Logged on `audit_log` like every
+ * other account change staff make from the website, with `changed` saying whether anything
+ * moved.
+ *
+ * `match` reads the account per connection-info request, so the switch is honoured the next
+ * time the player joins a room instance; the instance they're standing in keeps its server.
+ */
+export async function setSandboxHandler(c: Context<App>) {
+	const body = (await c.req.json().catch(() => null)) as { sandbox?: unknown } | null
+	if (body === null || typeof body !== 'object' || typeof body.sandbox !== 'boolean') {
+		return c.json({ error: 'Expected a JSON body with a boolean `sandbox`' }, 400)
+	}
+	const playerId = staffId(c)
+	const account = await getAccount(c.env.DB, playerId)
+	const was = account?.isSandbox === true
+	const changed = was !== body.sandbox
+	if (changed) await updateAccount(c.env.DB, playerId, { isSandbox: body.sandbox })
+
+	await recordPlayerAudit(c, 'set_sandbox', { playerId, sandbox: body.sandbox, changed })
+	logger.info('staff set their sandbox flag', {
+		moderatorId: playerId,
+		sandbox: body.sandbox,
+		changed,
+	})
+	return c.json({ sandbox: body.sandbox, changed })
 }

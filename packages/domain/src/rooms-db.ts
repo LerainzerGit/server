@@ -20,13 +20,10 @@
 import { bindPlaceholders, chunkForBinds, MAX_BOUND_PARAMS } from './d1-binds'
 import { Accessibility, Role } from './enums'
 import { countPlayersByRoom } from './presence-db'
-import {
-	bakedStudioUnityAssets,
-	isMissingStudioAssetTable,
-	listStudioUnityAssetFiles,
-} from './studio-unity-assets'
+import { resyncInstanceCapacity } from './room-instance-db'
+import { bakedUnityAssets, listUnityAssetBuilds } from './unity-assets-db'
 
-import type { StudioUnityAssetFile } from './studio-unity-assets'
+import type { UnityAssetBuild } from './unity-assets-db'
 
 /** Schema DDL (mirror of the head migration schema, sans the seed INSERT). */
 export const ROOM_SCHEMA_DDL: string[] = [
@@ -48,7 +45,10 @@ export const ROOM_SCHEMA_DDL: string[] = [
 		-- rest so the blob stays the only copy; they exist to be INDEXED — see
 		-- {@link LISTABLE_WHERE}.
 		accessibility INTEGER GENERATED ALWAYS AS (json_extract(data, '$.Accessibility')) VIRTUAL,
-		exclude_from_lists INTEGER GENERATED ALWAYS AS (json_extract(data, '$.ExcludeFromLists')) VIRTUAL
+		exclude_from_lists INTEGER GENERATED ALWAYS AS (json_extract(data, '$.ExcludeFromLists')) VIRTUAL,
+		-- The flag SEARCH filters on (migrations/0027_room_searchable.sql) — see
+		-- {@link SEARCHABLE_WHERE}.
+		exclude_from_search INTEGER GENERATED ALWAYS AS (json_extract(data, '$.ExcludeFromSearch')) VIRTUAL
 	)`,
 	`CREATE UNIQUE INDEX IF NOT EXISTS idx_rooms_room_id ON room (room_id)`,
 	`CREATE INDEX IF NOT EXISTS idx_rooms_name_lower ON room (name_lower)`,
@@ -853,6 +853,45 @@ export async function setRoomDescription(
 	await db
 		.prepare("UPDATE room SET data = json_set(data, '$.Description', ?2) WHERE room_id = ?1")
 		.bind(roomId, description)
+		.run()
+}
+
+/** A room's progression settings, as `GET /rooms/:id/experience` serves them. */
+export interface RoomProgression {
+	Enabled: boolean
+	DailyLimit: number
+}
+
+/**
+ * Read a room's progression settings off its blob: `progressionEnabled` and
+ * `progressionDailyLimit`. A room that has never had them set reads as off with a 0 cap.
+ */
+export function roomProgression(room: Room): RoomProgression {
+	const limit = room.progressionDailyLimit
+	return {
+		Enabled: room.progressionEnabled === true,
+		DailyLimit: typeof limit === 'number' && Number.isFinite(limit) ? limit : 0,
+	}
+}
+
+/**
+ * Set a room's progression settings in place (the caller checks ownership first). These
+ * are `progressionEnabled` / `progressionDailyLimit` on the blob; the per-player XP is in
+ * `room_xp` (see room-xp-db.ts).
+ */
+export async function setRoomProgression(
+	db: D1Database,
+	roomId: number,
+	enabled: boolean,
+	dailyLimit: number
+): Promise<void> {
+	await db
+		.prepare(
+			`UPDATE room
+			 SET data = json_set(data, '$.progressionEnabled', json(?2), '$.progressionDailyLimit', ?3)
+			 WHERE room_id = ?1`
+		)
+		.bind(roomId, enabled ? 'true' : 'false', dailyLimit)
 		.run()
 }
 
@@ -1837,6 +1876,10 @@ export interface ModifySubRoomInput {
  * (the fields the client's subroom `modify` form carries). Only the supplied fields
  * are changed; the subroom row is updated in the `subroom` table. Returns the updated
  * (hydrated) room, or null when the room or subroom doesn't exist.
+ *
+ * A changed `MaxPlayers` is pushed onto the subroom's LIVE instances too (see
+ * {@link resyncInstanceCapacity}): each instance carries a copy of the cap it enforces,
+ * and this is the write that makes that copy stale.
  */
 export async function modifySubRoom(
 	db: D1Database,
@@ -1849,8 +1892,10 @@ export async function modifySubRoom(
 
 	if (input.name !== undefined) sub.Name = input.name
 	if (input.accessibility !== undefined) sub.Accessibility = input.accessibility
+	const capacityChanged = input.maxPlayers !== undefined && input.maxPlayers !== sub.MaxPlayers
 	if (input.maxPlayers !== undefined) sub.MaxPlayers = input.maxPlayers
 	await updateSubRoom(db, sub)
+	if (capacityChanged) await resyncInstanceCapacity(db, roomId, subRoomId, input.maxPlayers!)
 
 	return getRoomById(db, roomId)
 }
@@ -2027,10 +2072,22 @@ const LISTABLE_WHERE = 'is_dorm IS NOT 1 AND accessibility = 1 AND exclude_from_
 
 /**
  * The wider half of {@link LISTABLE_WHERE}: public and not a dorm, without the
- * `ExcludeFromLists` term. What SEARCH considers — a room can opt out of the browse feeds
- * and still be findable by name — so the two searching reads select on this instead.
+ * `ExcludeFromLists` term. What `idx_room_public` covers, and the base of
+ * {@link SEARCHABLE_WHERE}.
  */
 const PUBLIC_WHERE = 'is_dorm IS NOT 1 AND accessibility = 1'
+
+/**
+ * What SEARCH considers — the same test {@link isSearchable} makes in memory, pushed down
+ * like {@link LISTABLE_WHERE} is for the feeds. `ExcludeFromSearch` is a room's own flag,
+ * independent of `ExcludeFromLists`: a room can opt out of the browse feeds and still be
+ * findable by name, or be in every feed and unfindable by name. So the two searching reads
+ * ({@link searchRooms}, {@link autocompleteRoomSearch}) select on this and NOT on the
+ * listable predicate; `idx_room_public` still narrows them to the public rooms, and the
+ * search term is checked against the rows it fetched. The in-memory filter stays, for the
+ * same reason it does with the feeds.
+ */
+const SEARCHABLE_WHERE = `${PUBLIC_WHERE} AND exclude_from_search IS NOT 1`
 
 /**
  * The columns a scan-then-rank feed selects in place of {@link ROOM_COLUMNS}: a STUB room
@@ -2241,10 +2298,10 @@ async function attachCurrentSaves(
 }
 
 /**
- * Fill `UnitySubAssets` on saves that point at a stored Studio build. Maker-pen
- * saves have no `UnityAssetId` and are left untouched, including their empty
- * arrays. A missing studio table is the same answer: the scene blob still loads,
- * and the bundle list stays empty until the migration exists.
+ * Fill `UnitySubAssets` on saves that point at a stored Studio build (rows of
+ * `unity_asset`). Maker-pen saves have no `UnityAssetId` and are left untouched,
+ * including their empty arrays; so is a save whose asset has no stored build —
+ * the scene blob still loads, and the bundle list stays empty.
  *
  * Only main bundles are listed. Stripped bundles stay in the bucket.
  */
@@ -2260,23 +2317,18 @@ export async function attachStudioUnityAssets(
 		),
 	]
 	if (ids.length === 0) return
-	let files: StudioUnityAssetFile[]
-	try {
-		files = await listStudioUnityAssetFiles(db, ids)
-	} catch (err) {
-		if (isMissingStudioAssetTable(err)) return
-		throw err
-	}
-	const byAsset = new Map<string, StudioUnityAssetFile[]>()
-	for (const file of files) {
-		const list = byAsset.get(file.unityAssetId) ?? []
-		list.push(file)
-		byAsset.set(file.unityAssetId, list)
+	const builds = await listUnityAssetBuilds(db, ids)
+	// Rows come back with the id lowercased; a save may spell its GUID either way.
+	const byAsset = new Map<string, UnityAssetBuild[]>()
+	for (const build of builds) {
+		const list = byAsset.get(build.UnityAssetId) ?? []
+		list.push(build)
+		byAsset.set(build.UnityAssetId, list)
 	}
 	for (const save of saves) {
 		const id = save.UnityAssetId
 		if (typeof id !== 'string') continue
-		const baked = bakedStudioUnityAssets(byAsset.get(id) ?? [])
+		const baked = bakedUnityAssets(byAsset.get(id.toLowerCase()) ?? [])
 		if (baked.length === 0) continue
 		save.UnitySubAssets = baked
 	}
@@ -2436,7 +2488,7 @@ function roomsByTagsQuery(
 	where = '',
 	columns = ROOM_COLUMNS
 ): { sql: string; binds: string[] } {
-	// `where` is the caller's row filter ({@link LISTABLE_WHERE} or {@link PUBLIC_WHERE}) —
+	// `where` is the caller's row filter ({@link LISTABLE_WHERE} or {@link SEARCHABLE_WHERE}) —
 	// unqualified, which is unambiguous under either shape below. It matters most when
 	// `tagSets` is EMPTY: that branch is the full scan every pseudo-tag feed still runs.
 	const filter = where === '' ? '' : ` WHERE ${where}`
@@ -2747,7 +2799,9 @@ export async function getSubRoomSaveById(
  * this permission overridden in this subroom?") plus a True/False picker for the value.
  * Unchecking it means "fall back to the default", so an entry arriving with
  * `Override: false` DELETES the stored row rather than storing anything. Every stored
- * entry is therefore an override, and reads always serve `Override: true`.
+ * entry is therefore an override and reads back `Override: true` at its own role; the
+ * `false` rows in a manager's token table are defaults the `rooms` worker fills in around
+ * them, never stored.
  */
 export interface RoomPermission {
 	Permission: string
@@ -3299,11 +3353,11 @@ function roomHasAnyTag(room: Room, tags: Set<string>): boolean {
 }
 
 /**
- * Search public, non-dorm rooms. The query is split into terms (space/`+`):
- * `#tag` terms match the room's Tags; plain terms match the room name
+ * Search public, non-dorm rooms not opted out of search. The query is split into terms
+ * (space/`+`): `#tag` terms match the room's Tags; plain terms match the room name
  * (substring). All terms must match. Returns a paginated `{ Results, TotalResults }`.
- * The rows narrow in SQL — public, non-dorm ({@link PUBLIC_WHERE}) — and the name terms
- * match in memory over what comes back.
+ * The rows narrow in SQL — public, non-dorm, searchable ({@link SEARCHABLE_WHERE}) — and
+ * the name terms match in memory over what comes back.
  *
  * `#community` is the one tag term that isn't a tag lookup — see {@link COMMUNITY_TAG}.
  */
@@ -3331,12 +3385,12 @@ export async function searchRooms(
 	const tagSets = tagTerms
 		.filter((tag) => tag !== COMMUNITY_TAG)
 		.map((tag) => [tag, ...(TAG_ALIASES[tag] ?? [])])
-	const { sql, binds } = roomsByTagsQuery(tagSets, PUBLIC_WHERE)
+	const { sql, binds } = roomsByTagsQuery(tagSets, SEARCHABLE_WHERE)
 	const { results } = await db
 		.prepare(sql)
 		.bind(...binds)
 		.all<RoomRow>()
-	let rooms = parseAll(results).filter((r) => r.IsDorm !== true && r.Accessibility === 1)
+	let rooms = parseAll(results).filter(isSearchable)
 
 	// The same test the hot feed's `community` chip applies: every room a player made, which
 	// is every room the Coach account doesn't own. It narrows the other terms rather than
@@ -3364,8 +3418,9 @@ export async function searchRooms(
  * which is the whole point of the endpoint: a suggestion that returns nothing is worse
  * than no suggestion. So the candidates are drawn from the two things that search matches
  * — room NAMES for a plain term, and TAGS for a `#tag` term — over the same public,
- * non-dorm rooms search itself considers. A tag comes back with its `#` so submitting the
- * suggestion verbatim searches by tag rather than for a room called "horror".
+ * non-dorm, searchable rooms search itself considers. A room opted out of search must not
+ * leak through its name or tags as a suggestion. A tag comes back with its `#` so
+ * submitting the suggestion verbatim searches by tag rather than for a room called "horror".
  *
  * A query starting with `#` is asking for tags, so only tags are suggested. Otherwise
  * names come first (the likelier intent), then tags, and within each, matches that START
@@ -3386,13 +3441,11 @@ export async function autocompleteRoomSearch(
 	if (q === '' || take <= 0) return []
 
 	const { results } = await db
-		.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE ${PUBLIC_WHERE}`)
+		.prepare(`SELECT ${ROOM_COLUMNS} FROM room WHERE ${SEARCHABLE_WHERE}`)
 		.all<RoomRow>()
 	// Tags attached up front: suggestions are drawn from them, and this reads every candidate
 	// room for its NAME regardless, so the tags cost one extra query rather than a second scan.
-	const rooms = (await parseAllWithTags(db, results)).filter(
-		(r) => r.IsDorm !== true && r.Accessibility === 1
-	)
+	const rooms = (await parseAllWithTags(db, results)).filter(isSearchable)
 
 	const tagQuery = q.startsWith('#')
 	const term = tagQuery ? q.slice(1) : q
@@ -3474,6 +3527,15 @@ function isRRO(room: Room): boolean {
  */
 function isListable(room: Room): boolean {
 	return room.IsDorm !== true && room.Accessibility === 1 && room.ExcludeFromLists !== true
+}
+
+/**
+ * True when the room may come back from a SEARCH: public, not a dorm, and not opted out of
+ * search. The search-side twin of {@link isListable} — `ExcludeFromSearch` is its own flag,
+ * so neither test implies the other; see {@link SEARCHABLE_WHERE}.
+ */
+function isSearchable(room: Room): boolean {
+	return room.IsDorm !== true && room.Accessibility === 1 && room.ExcludeFromSearch !== true
 }
 
 /**

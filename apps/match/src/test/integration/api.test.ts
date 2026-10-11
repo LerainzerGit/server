@@ -14,6 +14,7 @@ import {
 	EMPTY_INSTANCE_GRACE_SECONDS,
 	GAME_VERSION,
 	getRoomInstance,
+	modifySubRoom,
 	PRESENCE_SCHEMA_DDL,
 	ROOM_INSTANCE_SCHEMA_DDL,
 	ROOM_INVITE_SCHEMA_DDL,
@@ -2130,6 +2131,34 @@ describe('auth-gated endpoints', () => {
 		expect((await getRoomInstance(env.DB, instanceId))?.isFull).toBe(false)
 	})
 
+	test('raising a subroom’s MaxPlayers admits players into the running instance', async () => {
+		// A room with a cap of 1 and its own id, so no other test’s instances of SoloRoom
+		// are candidates here.
+		await seedRoomWithSubRooms(env.DB, {
+			RoomId: 5101,
+			Name: 'GrowingRoom',
+			IsDorm: false,
+			Accessibility: 1,
+			SubRooms: [{ SubRoomId: 5101, UnitySceneId: RECCENTER_SCENE, MaxPlayers: 1 }],
+		} as unknown as Record<string, unknown>)
+		const first = await matchmakeInto('5101', '830')
+		expect((await getRoomInstance(env.DB, first))?.isFull).toBe(true)
+
+		// The owner raises the cap in the subroom’s settings while the instance is live
+		// (what the `rooms` worker’s subroom settings route calls). The instance carries
+		// its own copy of the cap, so the write has to reach the running instance.
+		await modifySubRoom(env.DB, 5101, 5101, { maxPlayers: 2 })
+		const second = await matchmakeInto('5101', '831')
+		expect(second).toBe(first)
+
+		// And the served instance follows the subroom: 2 of 2 now, full again.
+		const instance = await getRoomInstance(env.DB, first)
+		expect(instance).toMatchObject({ maxCapacity: 2, isFull: true })
+		expect(await countPlayersInInstance(env.DB, first)).toBe(2)
+		const third = await matchmakeInto('5101', '832')
+		expect(third).not.toBe(first)
+	})
+
 	test('leaving a full instance clears its full flag', async () => {
 		// Fill SoloRoom, then the same player matchmakes into RecCenter — the SoloRoom
 		// instance they left should no longer be full.
@@ -2159,6 +2188,48 @@ describe('auth-gated endpoints', () => {
 		// Expired row gone, and the instance is joinable again.
 		expect(await countPresenceRows(824)).toBe(0)
 		expect((await getRoomInstance(env.DB, solo))?.isFull).toBe(false)
+	})
+
+	test('the cron sweep tells a lapsed player’s friends they went offline, as a logout does', async () => {
+		type Batch = {
+			playerIds: number[]
+			notificationType: number | string
+			data: { playerId: number; isOnline: boolean; roomInstance: Record<string, unknown> | null }
+		}
+		const hub = () => env.RECFLARE_NOTIFICATIONS_HUB.getByName('global')
+		const sent = async (): Promise<Batch[]> =>
+			(await (await hub().fetch('http://do/all')).json()) as Batch[]
+
+		// 825 is friends with 826; 827 has no friends and lapses alongside.
+		await env.DB.prepare(
+			'INSERT INTO relationship (requester_id, target_id, relationship_type) VALUES (?1, ?2, ?3)'
+		)
+			.bind(825, 826, 3)
+			.run()
+		await seedPresence(825, nowSeconds() - 10)
+		await seedPresence(827, nowSeconds() - 10)
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+
+		const ctx = createExecutionContext()
+		await scheduled(createScheduledController(), env, ctx)
+		await waitOnExecutionContext(ctx)
+
+		// Exactly one frame: the friend of the lapsed player, carrying the offline
+		// snapshot — the same frame `POST /player/logout` sends. The friendless player
+		// produces none.
+		const batch = await sent()
+		expect(batch).toHaveLength(1)
+		expect(batch[0]!.playerIds).toEqual([826])
+		expect(batch[0]!.notificationType).toBe('PresenceUpdate') // SubscriptionUpdatePresence
+		expect(batch[0]!.data).toMatchObject({ playerId: 825, isOnline: false, roomInstance: null })
+		expect(await countPresenceRows(825)).toBe(0)
+
+		// A second sweep has nothing lapsed → nothing sent.
+		await hub().fetch('http://do/all', { method: 'DELETE' })
+		const ctx2 = createExecutionContext()
+		await scheduled(createScheduledController(), env, ctx2)
+		await waitOnExecutionContext(ctx2)
+		expect(await sent()).toEqual([])
 	})
 
 	test('records an `online` stat sample of the live presence count on each run', async () => {
@@ -2529,6 +2600,73 @@ describe('auth-gated endpoints', () => {
 		).json()) as Array<{ roomInstanceId: number; playerIds: number[] }>
 		const target = listed.find((i) => i.roomInstanceId === instanceId)
 		expect(target?.playerIds).toEqual([42, 43])
+	})
+
+	test('PUT /roominstance/:id/matchpolicy is set from inside, and Ignore stops matchmaking into it', async () => {
+		// Room 77 subroom 34 — public, 10 seats, nobody's — so whoever stands in an instance
+		// is the one who may set its policy, and matchmaking reuses the oldest open one.
+		const spawn = async (player: string): Promise<number> => {
+			const res = await exports.default.fetch(`${ORIGIN}/matchmake/room/77/34`, {
+				method: 'POST',
+				headers: await bearer(player),
+			})
+			return ((await res.json()) as { roomInstance: { roomInstanceId: number } }).roomInstance
+				.roomInstanceId
+		}
+		const setPolicy = async (instanceId: number | string, policy: string, player?: string) =>
+			exports.default.fetch(`${ORIGIN}/roominstance/${instanceId}/matchpolicy`, {
+				method: 'PUT',
+				headers: {
+					...(player ? await bearer(player) : {}),
+					'Content-Type': 'application/x-www-form-urlencoded',
+				},
+				body: new URLSearchParams({ policy }).toString(),
+			})
+		const policyOf = async (instanceId: number) =>
+			(
+				await env.DB.prepare('SELECT matchmaking_policy AS p FROM room_instance WHERE id = ?1')
+					.bind(instanceId)
+					.first<{ p: number }>()
+			)?.p
+
+		const a = await spawn('4201')
+		expect(await policyOf(a)).toBe(0)
+
+		// No token → 401. Unknown instance → 404. A bad policy → 400, before any lookup.
+		expect((await setPolicy(a, '2')).status).toBe(401)
+		expect((await setPolicy(9999999, '2', '4201')).status).toBe(404)
+		expect((await setPolicy(a, '7', '4201')).status).toBe(400)
+		expect((await setPolicy(a, 'Ignore', '4201')).status).toBe(400)
+		// A player who is not standing in the instance → 403, however they relate to the room.
+		expect((await setPolicy(a, '2', '4299')).status).toBe(403)
+		expect(await policyOf(a)).toBe(0)
+
+		// The player inside sets Ignore (the client's body is `policy=2`): empty ack, stored.
+		const set = await setPolicy(a, '2', '4201')
+		expect(set.status).toBe(200)
+		expect(await set.text()).toBe('')
+		expect(await policyOf(a)).toBe(2)
+
+		// Excluded from matchmaking entirely: the next player gets a different instance even
+		// though A is open and has nine free seats. The one inside stays put.
+		const b = await spawn('4202')
+		expect(b).not.toBe(a)
+		expect(b).toBeGreaterThan(a)
+		// B's occupant cannot touch A's policy either.
+		expect((await setPolicy(a, '0', '4202')).status).toBe(403)
+
+		// Back to Default, A is the oldest open instance again and is reused.
+		expect((await setPolicy(a, '0', '4201')).status).toBe(200)
+		expect(await spawn('4203')).toBe(a)
+
+		// Avoid keeps A joinable but ranks it behind B, the only Default instance.
+		expect((await setPolicy(a, '1', '4201')).status).toBe(200)
+		expect(await policyOf(a)).toBe(1)
+		expect(await spawn('4204')).toBe(b)
+		// With B set to Ignore too, Avoid is still better than nothing: A is reused rather
+		// than a third instance opened.
+		expect((await setPolicy(b, '2', '4202')).status).toBe(200)
+		expect(await spawn('4205')).toBe(a)
 	})
 
 	test('POST /roominstance/:id/markprivate closes the instance, owner-only', async () => {
@@ -3770,6 +3908,7 @@ describe('auth-gated endpoints', () => {
 			'PUT /player/photonregionpings',
 			'PUT /player/statusvisibility',
 			'PUT /roominstance/{id}/inprogress',
+			'PUT /roominstance/{id}/matchpolicy',
 		])
 
 		// Every operation carries a summary — a path present but undescribed is not
